@@ -17,7 +17,9 @@ A terminal launch is only registration. A task starts at Codex's
 Normal mode uses one card per `turn_id`. Goal mode reads the optional
 `goals_1.sqlite` database and uses one card per `goal_id`; individual automatic
 turn completions keep that Goal card running until the database reports a
-terminal Goal state.
+terminal Goal state. The Codex notify hook also fires at each automatic turn
+boundary; while the Goal is active, the notifier converts that hook into a
+non-urgent progress update.
 
 ## State
 

@@ -295,29 +295,46 @@ def hook_complete():
         or payload.get("session-id") or payload.get("session_id")
     )
     rollout_path = find_rollout_path(thread_id)
-    state.update(
-        {
-            "status": "completed",
-            "active": True,
-            "turn_active": False,
-            "updated_at": now,
-            "last_completed_at": now,
-            "completed_at": int(payload.get("completed_at", now)),
-            "turn_started_at": turn_started_at,
-            "final_duration_seconds": max(0, int(payload.get("duration_ms", 0)) // 1000)
-            if payload.get("duration_ms") is not None else max(0, now - turn_started_at),
-            "task_title": extract_task_title(payload, state),
-            "current_step": "任务已完成",
-            "result_summary": extract_result_summary(payload),
-        }
-    )
     if thread_id:
         state["thread_id"] = str(thread_id)
     if rollout_path:
         state["rollout_path"] = str(rollout_path)
         state["rollout_offset"] = rollout_path.stat().st_size
+        goal_record = goal_record_for_rollout(rollout_path)
+        if goal_record:
+            apply_goal_record(state, goal_record)
+
+    active_goal = bool(state.get("goal_id") and state.get("goal_status") == "active")
+    common = {
+        "active": True,
+        "turn_active": False,
+        "updated_at": now,
+        "last_completed_at": now,
+        "turn_started_at": turn_started_at,
+        "task_title": extract_task_title(payload, state),
+        "result_summary": extract_result_summary(payload),
+    }
+    if active_goal:
+        common.update({
+            "status": "running",
+            "goal_running": True,
+            "current_step": "本轮已完成，等待 Goal 自动续跑",
+            "final_duration_seconds": None,
+        })
+        event_kind = "progress"
+    else:
+        common.update({
+            "status": "completed",
+            "goal_running": False,
+            "completed_at": int(payload.get("completed_at", now)),
+            "current_step": "任务已完成",
+            "final_duration_seconds": max(0, int(payload.get("duration_ms", 0)) // 1000)
+            if payload.get("duration_ms") is not None else max(0, now - turn_started_at),
+        })
+        event_kind = "completed"
+    state.update(common)
     atomic_json(path, state)
-    enqueue("completed", state, payload)
+    enqueue(event_kind, state, payload)
 
 
 def lifecycle_exit(exit_code, signal_name=""):
@@ -635,6 +652,16 @@ def should_urgent(kind, config):
     return bool(key) and is_true(config.get(key), True)
 
 
+def should_urgent_event(event, state, config):
+    # A Codex notify hook fires at the end of every automatic Goal turn. A
+    # delayed completion event must not alert while the Goal itself is active.
+    if (event.get("kind") == "completed"
+            and state.get("goal_id")
+            and state.get("goal_status") == "active"):
+        return False
+    return should_urgent(event.get("kind"), config)
+
+
 def urgent_message(message_id, config):
     recipient = config.get("LARK_USER_OPEN_ID", "")
     cli = config.get("LARK_CLI", str(DEFAULT_LARK_CLI))
@@ -708,7 +735,7 @@ def deliver_event(event, config):
 
     # Use the original event kind: progress refreshes can render a running card,
     # but only real lifecycle nodes should alert the user's phone.
-    if should_urgent(event["kind"], config):
+    if should_urgent_event(event, state, config):
         node_key = urgent_node_key(event, state)
         if card_metadata.get("last_urgent_node") != node_key:
             urgent_message(message_id, config)

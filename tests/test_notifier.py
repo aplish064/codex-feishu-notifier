@@ -230,6 +230,26 @@ class DeliveryTests(unittest.TestCase):
 
         urgent.assert_not_called()
 
+    def test_delayed_completion_never_urgents_while_goal_is_active(self):
+        data = event("completed", status="running")
+        data["state"].update({
+            "goal_id": "goal-1", "goal_status": "active", "goal_running": True,
+            "turn_cards": {"goal:goal-1": {
+                "message_id": "om_goal", "pinned_at": 200,
+                "last_urgent_node": "goal:goal-1:started",
+            }},
+        })
+        self.write_session(data)
+
+        with mock.patch.object(notifier, "urgent_message") as urgent, \
+             mock.patch.object(notifier, "pin_message") as pin, \
+             mock.patch.object(notifier, "patch_card") as patch:
+            notifier.deliver_event(data, {})
+
+        patch.assert_called_once()
+        pin.assert_not_called()
+        urgent.assert_not_called()
+
     def test_urgent_can_be_disabled_per_node(self):
         for kind in ("started", "completed", "stopped"):
             with self.subTest(kind=kind):
@@ -788,6 +808,44 @@ class DeliveryTests(unittest.TestCase):
         self.assertNotIn("用户原话", saved["task_title"])
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.args[0], "completed")
+
+    def test_notify_hook_treats_active_goal_turn_completion_as_progress(self):
+        data = event("started")
+        data["state"].update({
+            "managed": True,
+            "goal_id": "goal-1", "goal_status": "active", "goal_running": True,
+        })
+        self.write_session(data)
+        rollout = self.state_home / "rollout-thread-1.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        payload = {
+            "cwd": data["state"]["cwd"], "thread-id": "thread-1",
+            "turn-id": "turn-1", "started_at": 100, "completed_at": 130,
+            "duration_ms": 30000, "last-assistant-message": "本轮阶段已完成",
+        }
+        goal_record = {
+            "goal_thread_id": "thread-1", "goal_id": "goal-1",
+            "goal_status": "active", "goal_token_budget": None,
+            "goal_tokens_used": 20, "goal_time_used_seconds": 30,
+            "goal_created_at_ms": 100000, "goal_updated_at_ms": 130000,
+        }
+
+        with mock.patch.object(notifier, "parse_hook_payload", return_value=payload), \
+             mock.patch.dict(os.environ, {"CODEX_TASK_INSTANCE_ID": "session-1"}), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=rollout), \
+             mock.patch.object(notifier, "goal_record_for_rollout", return_value=goal_record), \
+             mock.patch.object(notifier, "enqueue") as enqueue, \
+             mock.patch.object(notifier.time, "time", return_value=130):
+            notifier.hook_complete()
+
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertEqual(saved["status"], "running")
+        self.assertFalse(saved["turn_active"])
+        self.assertTrue(saved["goal_running"])
+        self.assertIsNone(saved["final_duration_seconds"])
+        self.assertIn("等待 Goal 自动续跑", saved["current_step"])
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.args[0], "progress")
 
     def test_elapsed_refresh_is_throttled_to_five_seconds(self):
         data = event("started")

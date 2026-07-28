@@ -84,6 +84,11 @@ CODEX_TASK_NAME="payment-api" bin/codex-feishu
 | Interrupted/lost | Patch to red | Remove | Yes |
 | Goal continues next turn | Reuse Goal card | Keep | No extra card |
 
+Completing an automatic turn inside an active Goal is progress, not a Goal
+completion. It patches the existing card without an urgent notification. Only
+the initial Goal start and terminal Goal states (complete, interrupted, paused,
+blocked, or limited) alert the phone.
+
 Disable individual urgent nodes in the private `config.env`:
 
 ```bash
