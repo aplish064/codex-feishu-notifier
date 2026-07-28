@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export CODEX_TASK_NOTIFY_HOME="${CODEX_TASK_NOTIFY_HOME:-${HOME}/.local/share/codex-feishu-notifier}"
+CONFIG_PATH="${CODEX_TASK_NOTIFY_HOME}/config.env"
+if [[ -r "${CONFIG_PATH}" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "${CONFIG_PATH}"
+  set +a
+fi
+exec python3 "${REPO_ROOT}/notifier.py" status

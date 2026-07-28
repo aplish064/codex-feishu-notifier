@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+NOTIFIER="${REPO_ROOT}/notifier.py"
+export CODEX_TASK_NOTIFY_HOME="${CODEX_TASK_NOTIFY_HOME:-${HOME}/.local/share/codex-feishu-notifier}"
+CONFIG_PATH="${CODEX_TASK_NOTIFY_HOME}/config.env"
+
+if [[ ! -r "${CONFIG_PATH}" ]]; then
+  echo "Missing notifier configuration: ${CONFIG_PATH}" >&2
+  echo "Run ${REPO_ROOT}/setup.sh first." >&2
+  exit 1
+fi
+
+set -a
+# shellcheck source=/dev/null
+source "${CONFIG_PATH}"
+set +a
+
+CODEX_EXEC="${CODEX_BIN:-codex}"
+if ! command -v -- "${CODEX_EXEC}" >/dev/null 2>&1; then
+  echo "Codex executable not found: ${CODEX_EXEC}" >&2
+  exit 1
+fi
+
+WORKDIR="${PWD}"
+args=("$@")
+for ((index = 0; index < ${#args[@]}; index++)); do
+  case "${args[index]}" in
+    -C|--cd)
+      if ((index + 1 < ${#args[@]})); then
+        WORKDIR="${args[index + 1]}"
+      fi
+      ;;
+    --cd=*) WORKDIR="${args[index]#--cd=}" ;;
+  esac
+done
+WORKDIR="$(cd -- "${WORKDIR}" && pwd)"
+
+export CODEX_TASK_INSTANCE_ID="${CODEX_TASK_INSTANCE_ID:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}"
+export CODEX_TASK_STARTED_AT="$(date +%s)"
+export CODEX_TASK_WRAPPER_PID="$$"
+export CODEX_TASK_CWD="${WORKDIR}"
+export CODEX_TASK_NAME="${CODEX_TASK_NAME:-$(basename -- "${WORKDIR}")}"
+export CODEX_TASK_TTY="$(tty 2>/dev/null || printf 'unknown')"
+
+python3 "${NOTIFIER}" start >/dev/null 2>&1 || true
+
+exit_signal=""
+trap 'exit_signal=INT' INT
+trap 'exit_signal=TERM' TERM
+
+notify_override="notify=[\"python3\",\"${NOTIFIER}\",\"hook\"]"
+set +e
+"${CODEX_EXEC}" -c "${notify_override}" "$@"
+exit_code=$?
+set -e
+
+python3 "${NOTIFIER}" exit "${exit_code}" "${exit_signal}" >/dev/null 2>&1 || true
+exit "${exit_code}"

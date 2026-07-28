@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+config.env
+.env
+*.log
+*.sqlite
+*.sqlite3
+sessions/
+outbox/
+sent/
+lark-home/

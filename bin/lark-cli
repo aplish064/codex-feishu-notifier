@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+NOTIFIER_HOME="${CODEX_TASK_NOTIFY_HOME:-${HOME}/.local/share/codex-feishu-notifier}"
+LARK_HOME="${NOTIFIER_HOME}/lark-home"
+LARK_ENTRY="${REPO_ROOT}/node_modules/@larksuite/cli/scripts/run.js"
+
+if [[ ! -f "${LARK_ENTRY}" ]]; then
+  echo "lark-cli is not installed. Run: cd ${REPO_ROOT} && npm install" >&2
+  exit 1
+fi
+
+mkdir -p "${LARK_HOME}"
+exec env \
+  HOME="${LARK_HOME}" \
+  XDG_CONFIG_HOME="${LARK_HOME}/.config" \
+  XDG_DATA_HOME="${LARK_HOME}/.local/share" \
+  XDG_CACHE_HOME="${LARK_HOME}/.cache" \
+  LARK_CLI_NO_UPDATE_NOTIFIER=1 \
+  LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 \
+  node "${LARK_ENTRY}" "$@"
