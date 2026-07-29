@@ -767,6 +767,54 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(saved["current_step"], "正在核查本轮实现")
         self.assertFalse(saved["task_goal_pending"])
 
+    def test_active_goal_reads_stage_updates_from_root_rollout(self):
+        data = event("completed")
+        terminal_rollout = self.state_home / "rollout-child.jsonl"
+        terminal_rollout.write_text("{}\n", encoding="utf-8")
+        goal_rollout = self.state_home / "rollout-goal-root.jsonl"
+        records = [
+            {"type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "goal-turn-2", "started_at": 400,
+            }},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "phase": "commentary",
+                "content": [{"type": "output_text", "text": "正在推进 Goal 根线程的新阶段"}],
+            }},
+        ]
+        goal_rollout.write_text(
+            "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+        )
+        data["state"].update({
+            "active": True, "managed": True, "thread_id": "child-thread",
+            "rollout_path": str(terminal_rollout),
+            "rollout_offset": terminal_rollout.stat().st_size + 1000,
+            "started_at": 100, "turn_active": False,
+            "goal_id": "goal-1", "goal_status": "active", "goal_running": True,
+        })
+        self.write_session(data)
+        goal_record = {
+            "goal_thread_id": "goal-root", "goal_id": "goal-1",
+            "goal_status": "active", "goal_token_budget": None,
+            "goal_tokens_used": 10, "goal_time_used_seconds": 20,
+            "goal_created_at_ms": 100000, "goal_updated_at_ms": 130000,
+        }
+
+        with mock.patch.object(notifier, "goal_record_for_rollout", return_value=goal_record), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=goal_rollout), \
+             mock.patch.object(notifier, "enqueue") as enqueue:
+            notifier.sweep_turn_events()
+
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertEqual(saved["rollout_path"], str(terminal_rollout))
+        self.assertEqual(saved["rollout_offset"], terminal_rollout.stat().st_size)
+        self.assertEqual(saved["goal_rollout_path"], str(goal_rollout))
+        self.assertEqual(saved["goal_rollout_thread_id"], "goal-root")
+        self.assertEqual(saved["goal_rollout_offset"], goal_rollout.stat().st_size)
+        self.assertEqual(saved["turn_id"], "goal-turn-2")
+        self.assertTrue(saved["turn_active"])
+        self.assertEqual(saved["task_title"], "正在推进 Goal 根线程的新阶段")
+        self.assertEqual(enqueue.call_args.args[0], "started")
+
     def test_goal_complete_transition_enqueues_completion(self):
         data = event("started")
         data["state"].update({
@@ -900,6 +948,43 @@ class DeliveryTests(unittest.TestCase):
         self.assertIn("等待 Goal 自动续跑", saved["current_step"])
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.args[0], "progress")
+
+    def test_notify_hook_ignores_active_goal_descendant_completion(self):
+        data = event("started")
+        data["state"].update({
+            "managed": True, "thread_id": "child-thread",
+            "rollout_path": "/terminal-rollout.jsonl",
+            "goal_thread_id": "goal-root", "goal_id": "goal-1",
+            "goal_status": "active", "goal_running": True,
+            "task_title": "根 Goal 当前阶段", "current_step": "正在执行根 Goal",
+        })
+        self.write_session(data)
+        child_rollout = self.state_home / "rollout-child.jsonl"
+        child_rollout.write_text("{}\n", encoding="utf-8")
+        payload = {
+            "cwd": data["state"]["cwd"], "thread-id": "child-thread",
+            "turn-id": "child-turn", "completed_at": 130,
+            "duration_ms": 30000, "last-assistant-message": "子线程已完成",
+        }
+        goal_record = {
+            "goal_thread_id": "goal-root", "goal_id": "goal-1",
+            "goal_status": "active", "goal_token_budget": None,
+            "goal_tokens_used": 20, "goal_time_used_seconds": 30,
+            "goal_created_at_ms": 100000, "goal_updated_at_ms": 130000,
+        }
+
+        with mock.patch.object(notifier, "parse_hook_payload", return_value=payload), \
+             mock.patch.dict(os.environ, {"CODEX_TASK_INSTANCE_ID": "session-1"}), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=child_rollout), \
+             mock.patch.object(notifier, "goal_record_for_rollout", return_value=goal_record), \
+             mock.patch.object(notifier, "enqueue") as enqueue:
+            notifier.hook_complete()
+
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertTrue(saved["turn_active"])
+        self.assertEqual(saved["task_title"], "根 Goal 当前阶段")
+        self.assertEqual(saved["current_step"], "正在执行根 Goal")
+        enqueue.assert_not_called()
 
     def test_elapsed_time_does_not_generate_timer_only_card_updates(self):
         data = event("started")

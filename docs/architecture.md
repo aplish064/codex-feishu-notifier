@@ -21,6 +21,13 @@ terminal Goal state. The Codex notify hook also fires at each automatic turn
 boundary; while the Goal is active, the notifier converts that hook into a
 non-urgent progress update.
 
+The terminal rollout and Goal rollout can be different files. A descendant
+terminal thread can resolve to a Goal row through `parent_thread_id`, while the
+automatic continuation records are appended to the row's `thread_id` root
+rollout. The notifier stores separate offsets for both files and tails the Goal
+root while its status is active. Completion hooks from descendant threads are
+ignored for Goal lifecycle state.
+
 The long-term Goal objective is retained as lifecycle metadata but does not
 overwrite the card's current stage. Each `task_started` event resets the stage
 summary and timer, the first public commentary supplies the organized stage

@@ -265,6 +265,61 @@ def find_rollout_path(thread_id):
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
+def latest_turn_start_offset(path):
+    latest = None
+    try:
+        with path.open("rb") as stream:
+            while True:
+                offset = stream.tell()
+                raw_line = stream.readline()
+                if not raw_line:
+                    break
+                if b'"task_started"' not in raw_line:
+                    continue
+                try:
+                    item = json.loads(raw_line)
+                except (UnicodeError, ValueError):
+                    continue
+                payload = item.get("payload", {})
+                if item.get("type") == "event_msg" and payload.get("type") == "task_started":
+                    latest = offset
+    except OSError:
+        return 0
+    return latest if latest is not None else path.stat().st_size
+
+
+def event_rollout_for_state(state, terminal_rollout, goal_record):
+    if not goal_record or goal_record.get("goal_status") != "active":
+        return terminal_rollout, "rollout_offset"
+    goal_thread_id = str(goal_record.get("goal_thread_id") or "")
+    cached_path = Path(state.get("goal_rollout_path", ""))
+    if (goal_thread_id and cached_path.is_file()
+            and state.get("goal_rollout_thread_id") == goal_thread_id):
+        goal_rollout = cached_path
+    else:
+        goal_rollout = find_rollout_path(goal_thread_id)
+    if not goal_rollout or not goal_rollout.is_file():
+        return terminal_rollout, "rollout_offset"
+    goal_rollout_text = str(goal_rollout)
+    if state.get("goal_rollout_path") != goal_rollout_text:
+        state["goal_rollout_path"] = goal_rollout_text
+        state["goal_rollout_offset"] = latest_turn_start_offset(goal_rollout)
+    state["goal_rollout_thread_id"] = goal_thread_id
+    return goal_rollout, "goal_rollout_offset"
+
+
+def normalized_rollout_offset(state, path, key):
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return int(state.get(key, 0))
+    offset = int(state.get(key, 0))
+    if offset < 0 or offset > size:
+        state[key] = size
+        return size
+    return offset
+
+
 def hook_complete():
     payload = parse_hook_payload()
     cwd = payload.get("cwd") or os.environ.get("CODEX_TASK_CWD") or os.getcwd()
@@ -296,13 +351,19 @@ def hook_complete():
         or payload.get("session-id") or payload.get("session_id")
     )
     rollout_path = find_rollout_path(thread_id)
-    if thread_id:
+    goal_record = goal_record_for_rollout(rollout_path) if rollout_path else {}
+    if (state.get("managed") and goal_record
+            and goal_record.get("goal_status") == "active"
+            and thread_id
+            and str(thread_id) != str(goal_record.get("goal_thread_id"))):
+        return
+    if thread_id and (not state.get("managed") or not state.get("thread_id")):
         state["thread_id"] = str(thread_id)
     if rollout_path:
-        state["rollout_path"] = str(rollout_path)
+        if not state.get("managed") or not state.get("rollout_path"):
+            state["rollout_path"] = str(rollout_path)
         if not state.get("managed"):
             state["rollout_offset"] = rollout_path.stat().st_size
-        goal_record = goal_record_for_rollout(rollout_path)
         if goal_record:
             apply_goal_record(state, goal_record)
 
@@ -855,6 +916,7 @@ def clear_goal_record(state):
         "goal_thread_id", "goal_id", "goal_status", "goal_token_budget",
         "goal_tokens_used", "goal_time_used_seconds", "goal_created_at_ms",
         "goal_updated_at_ms", "goal_running", "goal_task_title",
+        "goal_rollout_path", "goal_rollout_offset", "goal_rollout_thread_id",
     ):
         state.pop(key, None)
 
@@ -1038,16 +1100,17 @@ def sweep_turn_events():
             # each historical transition.
             state["turn_active"] = False
             state["rollout_offset"] = 0
-        rollout_path = Path(state.get("rollout_path", ""))
-        if not rollout_path.is_file():
-            rollout_path, thread_id = assign_rollout(state)
-            if not rollout_path:
+        terminal_rollout = Path(state.get("rollout_path", ""))
+        if not terminal_rollout.is_file():
+            terminal_rollout, thread_id = assign_rollout(state)
+            if not terminal_rollout:
                 continue
             state["thread_id"] = thread_id
-            state["rollout_path"] = str(rollout_path)
+            state["rollout_path"] = str(terminal_rollout)
             state["rollout_offset"] = 0
+        normalized_rollout_offset(state, terminal_rollout, "rollout_offset")
 
-        goal_record = goal_record_for_rollout(rollout_path)
+        goal_record = goal_record_for_rollout(terminal_rollout)
         if goal_record:
             goal_event_kind = synchronize_goal_state(state, goal_record, now)
             if goal_event_kind:
@@ -1058,7 +1121,10 @@ def sweep_turn_events():
                     "turn-id": state.get("turn_id"),
                 })
 
-        old_offset = int(state.get("rollout_offset", 0))
+        rollout_path, offset_key = event_rollout_for_state(
+            state, terminal_rollout, goal_record
+        )
+        old_offset = normalized_rollout_offset(state, rollout_path, offset_key)
         try:
             records = []
             with rollout_path.open("r", encoding="utf-8") as stream:
@@ -1242,8 +1308,7 @@ def sweep_turn_events():
                 if not catching_up:
                     enqueue("stopped", dict(state), {"turn-id": aborted_turn_id})
 
-        state["rollout_path"] = str(rollout_path)
-        state["rollout_offset"] = new_offset
+        state[offset_key] = new_offset
         atomic_json(state_path, state)
         if changed and event_kind:
             event_payload = {"turn-id": state.get("turn_id")}

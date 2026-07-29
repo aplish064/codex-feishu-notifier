@@ -9,6 +9,7 @@ Codex 启动后，只有在用户真正发送任务时才创建卡片。任务�
 
 - One card per normal Codex turn.
 - One persistent card per Codex Goal, across automatic continuation turns.
+- Goal root-thread tracking even when the monitored terminal runs a descendant thread.
 - Pin only while a task is active; automatically remove stale Pins.
 - Blue running, green completed, red interrupted, and grey archived cards.
 - App urgent notifications on start, completion, and interruption.
@@ -96,6 +97,12 @@ recomputed on meaningful progress updates, runs from `task_started` to that
 turn's completion, and then remains frozen while the Goal waits for its next
 automatic turn. The notifier deliberately avoids timer-only card PATCH calls
 because Feishu mobile surfaces every card edit as message activity.
+
+Codex may attach a terminal to a descendant thread while automatic Goal turns
+continue in the Goal's root thread. The notifier keeps independent rollout
+paths and offsets for both, follows the root thread while the Goal is active,
+and ignores descendant completion hooks that would otherwise freeze the Goal
+card at a stale waiting state.
 
 Disable individual urgent nodes in the private `config.env`:
 
