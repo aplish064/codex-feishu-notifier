@@ -12,8 +12,8 @@ Codex 启动后，只有在用户真正发送任务时才创建卡片。任务�
 - Pin only while a task is active; automatically remove stale Pins.
 - Blue running, green completed, red interrupted, and grey archived cards.
 - App urgent notifications on start, completion, and interruption.
-- Organized task goals from Codex's public execution summary instead of raw prompts.
-- Live progress, sanitized tool activity, elapsed time, terminal, and workspace.
+- Organized stage goals from each turn's first public execution summary instead of raw prompts.
+- Live progress, sanitized tool activity, current-stage elapsed time, terminal, and workspace.
 - Manual `turn_aborted`, lost process, clean completion, and Goal terminal states.
 - No webhook server and no public inbound endpoint.
 
@@ -88,6 +88,12 @@ Completing an automatic turn inside an active Goal is progress, not a Goal
 completion. It patches the existing card without an urgent notification. Only
 the initial Goal start and terminal Goal states (complete, interrupted, paused,
 blocked, or limited) alert the phone.
+
+For a continuing Goal, every automatic turn resets the displayed task goal and
+timer. The first public commentary becomes that turn's organized stage goal;
+later public commentary updates the current step. `Current stage elapsed` runs
+from `task_started` to that turn's completion and then remains frozen while the
+Goal waits for its next automatic turn.
 
 Disable individual urgent nodes in the private `config.env`:
 

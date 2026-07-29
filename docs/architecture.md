@@ -21,6 +21,12 @@ terminal Goal state. The Codex notify hook also fires at each automatic turn
 boundary; while the Goal is active, the notifier converts that hook into a
 non-urgent progress update.
 
+The long-term Goal objective is retained as lifecycle metadata but does not
+overwrite the card's current stage. Each `task_started` event resets the stage
+summary and timer, the first public commentary supplies the organized stage
+goal, and later public commentary supplies the current step. Stage completion
+freezes that turn's duration while the card waits for automatic continuation.
+
 ## State
 
 The private state directory contains:
@@ -53,7 +59,7 @@ one card per turn.
 
 Cards may contain:
 
-- an organized goal derived from Codex's first public commentary;
+- an organized current-stage goal derived from Codex's first public commentary;
 - public progress commentary;
 - generic tool categories such as "running command" or "editing files";
 - result summary, elapsed time, terminal label, project and working directory.

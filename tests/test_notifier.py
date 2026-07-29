@@ -38,6 +38,9 @@ def event(kind, status=None):
 
 
 class CardTests(unittest.TestCase):
+    def test_concise_title_accepts_null_agent_message(self):
+        self.assertEqual(notifier.concise_title(None), "")
+
     def test_status_styles_use_card_2(self):
         expected = {
             "started": ("blue", "Codex 任务已启动"),
@@ -85,6 +88,25 @@ class CardTests(unittest.TestCase):
         labels = [column["elements"][1]["content"] for column in metrics]
         self.assertIn("**用户停止**", values)
         self.assertTrue(any("中断原因" in label for label in labels))
+
+    def test_goal_card_uses_current_stage_elapsed_time(self):
+        data = event("started")
+        data["created_at"] = 370
+        data["state"].update({
+            "goal_id": "goal-1",
+            "goal_created_at_ms": 1000,
+            "turn_started_at": 340,
+            "turn_duration_seconds": None,
+        })
+
+        card = notifier.render_card(data)
+        metrics = card["body"]["elements"][1]["columns"]
+        values = [column["elements"][0]["content"] for column in metrics]
+        labels = [column["elements"][1]["content"] for column in metrics]
+
+        self.assertIn("**30s**", values)
+        self.assertTrue(any("当前阶段耗时" in label for label in labels))
+        self.assertFalse(any("本轮耗时" in label for label in labels))
 
 
 class DeliveryTests(unittest.TestCase):
@@ -685,7 +707,7 @@ class DeliveryTests(unittest.TestCase):
         pin.assert_not_called()
         urgent.assert_not_called()
 
-    def test_goal_continuation_keeps_organized_goal_title(self):
+    def test_goal_continuation_updates_title_to_current_stage(self):
         data = event("completed")
         rollout = self.state_home / "rollout-thread-1.jsonl"
         records = [
@@ -712,7 +734,8 @@ class DeliveryTests(unittest.TestCase):
             notifier.sweep_turn_events()
 
         saved = notifier.read_json(notifier.session_path("session-1"))
-        self.assertEqual(saved["task_title"], "完善学校人员发现与人才履历采集")
+        self.assertEqual(saved["task_title"], "正在核查本轮实现")
+        self.assertEqual(saved["current_step"], "正在核查本轮实现")
         self.assertFalse(saved["task_goal_pending"])
 
     def test_goal_complete_transition_enqueues_completion(self):
@@ -842,7 +865,9 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(saved["status"], "running")
         self.assertFalse(saved["turn_active"])
         self.assertTrue(saved["goal_running"])
-        self.assertIsNone(saved["final_duration_seconds"])
+        self.assertEqual(saved["turn_duration_seconds"], 30)
+        self.assertEqual(saved["final_duration_seconds"], 30)
+        self.assertEqual(saved.get("rollout_offset", 0), 0)
         self.assertIn("等待 Goal 自动续跑", saved["current_step"])
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.args[0], "progress")

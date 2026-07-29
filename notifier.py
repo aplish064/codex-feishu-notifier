@@ -177,6 +177,7 @@ def payload_text(value):
 
 
 def concise_title(text, limit=72):
+    text = str(text or "")
     text = re.sub(r"<environment_context>.*?</environment_context>", " ", text, flags=re.DOTALL)
     text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
     text = re.sub(r"</?[^>]+>", " ", text)
@@ -237,8 +238,6 @@ def organized_task_goal(text):
 
 
 def extract_task_title(payload, state):
-    if state.get("goal_task_title"):
-        return state["goal_task_title"]
     if state.get("task_goal_source") == "assistant_commentary" and state.get("task_title"):
         return state["task_title"]
     assistant = payload_text(
@@ -299,7 +298,8 @@ def hook_complete():
         state["thread_id"] = str(thread_id)
     if rollout_path:
         state["rollout_path"] = str(rollout_path)
-        state["rollout_offset"] = rollout_path.stat().st_size
+        if not state.get("managed"):
+            state["rollout_offset"] = rollout_path.stat().st_size
         goal_record = goal_record_for_rollout(rollout_path)
         if goal_record:
             apply_goal_record(state, goal_record)
@@ -315,11 +315,14 @@ def hook_complete():
         "result_summary": extract_result_summary(payload),
     }
     if active_goal:
+        turn_duration = max(0, int(payload.get("duration_ms", 0)) // 1000) \
+            if payload.get("duration_ms") is not None else max(0, now - turn_started_at)
         common.update({
             "status": "running",
             "goal_running": True,
             "current_step": "本轮已完成，等待 Goal 自动续跑",
-            "final_duration_seconds": None,
+            "turn_duration_seconds": turn_duration,
+            "final_duration_seconds": turn_duration,
         })
         event_kind = "progress"
     else:
@@ -414,20 +417,19 @@ def render_card(event, monitor=True):
         "archived": ("Codex Goal 历史卡片", "已归档", "grey", "grey-50", "neutral"),
     }
     title, status_label, template, background, accent = styles.get(kind, styles["started"])
-    if state.get("goal_id") and state.get("goal_created_at_ms"):
-        started = int(state["goal_created_at_ms"]) // 1000
-    else:
-        started = int(state.get("turn_started_at", state.get("started_at", event["created_at"])))
+    started = int(state.get("turn_started_at", state.get("started_at", event["created_at"])))
     terminal = state.get("tmux_pane") or state.get("tty") or "unknown"
     task_title = state.get("task_title")
     if not task_title or (kind == "started" and task_title == state.get("label")):
         task_title = "等待 Codex 接收并执行任务"
-    elapsed_seconds = state.get("final_duration_seconds")
+    elapsed_seconds = (state.get("turn_duration_seconds") if state.get("goal_id")
+                       else state.get("final_duration_seconds"))
     if elapsed_seconds is None:
         elapsed_seconds = event["created_at"] - started
     elapsed = duration_text(elapsed_seconds)
     project = Path(state.get("cwd", "unknown")).name
-    metric_values = [(status_label, "状态"), (elapsed, "本轮耗时")]
+    duration_label = "当前阶段耗时" if state.get("goal_id") else "本轮耗时"
+    metric_values = [(status_label, "状态"), (elapsed, duration_label)]
     if kind == "stopped":
         if state.get("abort_reason"):
             reason = "用户停止" if state["abort_reason"] == "interrupted" else state["abort_reason"]
@@ -862,11 +864,11 @@ def migrate_current_card_to_goal(state, goal_id):
     state["turn_cards"] = cards
 
 
-def goal_elapsed_seconds(state, now):
-    created_at_ms = state.get("goal_created_at_ms")
-    if created_at_ms:
-        return max(0, now - int(created_at_ms) // 1000)
-    return max(0, now - int(state.get("turn_started_at", now)))
+def current_turn_elapsed_seconds(state, now):
+    if state.get("turn_duration_seconds") is not None:
+        return max(0, int(state["turn_duration_seconds"]))
+    end = now if state.get("turn_active") else int(state.get("last_completed_at", now))
+    return max(0, end - int(state.get("turn_started_at", end)))
 
 
 def synchronize_goal_state(state, record, now):
@@ -880,9 +882,6 @@ def synchronize_goal_state(state, record, now):
         if state.get("task_goal_source") == "assistant_commentary":
             state["goal_task_title"] = state.get("task_title")
     apply_goal_record(state, record)
-    if state.get("goal_task_title"):
-        state["task_title"] = state["goal_task_title"]
-        state["task_goal_pending"] = False
     goal_status = record["goal_status"]
     event_kind = ""
 
@@ -895,6 +894,7 @@ def synchronize_goal_state(state, record, now):
                 "status": "running",
                 "current_step": "Goal 正在继续执行",
                 "final_duration_seconds": None,
+                "turn_duration_seconds": None,
             })
             event_kind = "started"
     elif goal_status == "complete":
@@ -903,7 +903,8 @@ def synchronize_goal_state(state, record, now):
             "turn_active": False,
             "goal_running": False,
             "current_step": "Goal 已完成",
-            "final_duration_seconds": goal_elapsed_seconds(state, now),
+            "turn_duration_seconds": current_turn_elapsed_seconds(state, now),
+            "final_duration_seconds": current_turn_elapsed_seconds(state, now),
         })
         if previous_goal_status != goal_status or previous_status != "completed":
             event_kind = "completed"
@@ -919,7 +920,8 @@ def synchronize_goal_state(state, record, now):
             "turn_active": False,
             "goal_running": False,
             "current_step": labels.get(goal_status, "Goal 已暂停"),
-            "final_duration_seconds": goal_elapsed_seconds(state, now),
+            "turn_duration_seconds": current_turn_elapsed_seconds(state, now),
+            "final_duration_seconds": current_turn_elapsed_seconds(state, now),
         })
         if previous_goal_status != goal_status or previous_status != goal_status:
             event_kind = "stopped"
@@ -1090,9 +1092,9 @@ def sweep_turn_events():
                     "abort_reason", "aborted_at", "last_aborted_at", "signal", "exit_code",
                 ):
                     state.pop(key, None)
-                active_goal_title = state.get("goal_task_title") if (
+                active_goal = bool(
                     state.get("goal_id") and state.get("goal_status") == "active"
-                ) else ""
+                )
                 state.update({
                     "status": "running",
                     "turn_active": True,
@@ -1100,16 +1102,15 @@ def sweep_turn_events():
                     "turn_started_at": turn_started_at,
                     "turn_id": payload.get("turn_id"),
                     "last_started_turn_id": payload.get("turn_id"),
-                    "task_title": active_goal_title or "正在整理任务目标",
-                    "task_goal_source": "assistant_commentary" if active_goal_title else "pending",
-                    "task_goal_pending": not bool(active_goal_title),
-                    "current_step": "正在分析任务",
+                    "task_title": "正在整理本阶段目标" if active_goal else "正在整理任务目标",
+                    "task_goal_source": "pending",
+                    "task_goal_pending": True,
+                    "current_step": "正在分析本阶段任务" if active_goal else "正在分析任务",
                     "recent_action": "",
                     "result_summary": "",
                     "final_duration_seconds": None,
-                    "goal_running": bool(
-                        state.get("goal_id") and state.get("goal_status") == "active"
-                    ),
+                    "turn_duration_seconds": None,
+                    "goal_running": active_goal,
                 })
                 changed = True
                 event_kind = "started"
@@ -1134,8 +1135,6 @@ def sweep_turn_events():
                         state["task_title"] = task_goal
                         state["task_goal_source"] = "assistant_commentary"
                         state["task_goal_pending"] = False
-                        if state.get("goal_id") and state.get("goal_status") == "active":
-                            state["goal_task_title"] = task_goal
                         changed = True
                 step = concise_detail(public_text)
                 if step and step != state.get("current_step"):
@@ -1158,6 +1157,10 @@ def sweep_turn_events():
 
             if item_type == "event_msg" and payload_type == "task_complete":
                 duration_ms = payload.get("duration_ms")
+                turn_duration = max(0, int(duration_ms) // 1000) \
+                    if duration_ms is not None else max(
+                        0, now - int(state.get("turn_started_at", now))
+                    )
                 if state.get("goal_id") and state.get("goal_status") == "active":
                     state.update({
                         "status": "running",
@@ -1169,7 +1172,8 @@ def sweep_turn_events():
                         "result_summary": concise_title(
                             payload.get("last_agent_message", ""), limit=110
                         ),
-                        "final_duration_seconds": None,
+                        "turn_duration_seconds": turn_duration,
+                        "final_duration_seconds": turn_duration,
                     })
                     completion_kind = "progress"
                 else:
@@ -1184,10 +1188,8 @@ def sweep_turn_events():
                         "result_summary": concise_title(
                             payload.get("last_agent_message", ""), limit=110
                         ),
-                        "final_duration_seconds": max(0, int(duration_ms) // 1000)
-                        if duration_ms is not None else max(
-                            0, now - int(state.get("turn_started_at", now))
-                        ),
+                        "turn_duration_seconds": turn_duration,
+                        "final_duration_seconds": turn_duration,
                     })
                     completion_kind = "completed"
                 changed = True
@@ -1215,6 +1217,10 @@ def sweep_turn_events():
                     "current_step": "任务已中断",
                     "result_summary": "用户手动停止了本轮任务",
                     "final_duration_seconds": max(0, int(duration_ms) // 1000)
+                    if duration_ms is not None else max(
+                        0, now - int(state.get("turn_started_at", now))
+                    ),
+                    "turn_duration_seconds": max(0, int(duration_ms) // 1000)
                     if duration_ms is not None else max(
                         0, now - int(state.get("turn_started_at", now))
                     ),
