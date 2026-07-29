@@ -34,6 +34,8 @@ GOALS_DB_PATH = Path(
     os.environ.get("CODEX_TASK_GOALS_DB", str(CODEX_HOME / "goals_1.sqlite"))
 )
 DEFAULT_LARK_CLI = SCRIPT_DIR / "bin" / "lark-cli"
+MAX_LIVE_SWEEP_RECORDS = 500
+MAX_LIVE_SWEEP_BYTES = 512 * 1024
 
 
 def load_config():
@@ -711,6 +713,7 @@ def deliver_event(event, config):
             and (not isinstance(existing_cards, dict) or card_key not in existing_cards)):
         save_turn_card_metadata(identifier, card_key, **card_metadata)
     message_id = card_metadata.get("message_id")
+    card_existed = bool(message_id)
     if message_id:
         patch_card(message_id, render_card(live_event, monitor=True), config)
     else:
@@ -737,7 +740,10 @@ def deliver_event(event, config):
 
     # Use the original event kind: progress refreshes can render a running card,
     # but only real lifecycle nodes should alert the user's phone.
-    if should_urgent_event(event, state, config):
+    automatic_goal_continuation = bool(
+        event.get("kind") == "started" and state.get("goal_id") and card_existed
+    )
+    if not automatic_goal_continuation and should_urgent_event(event, state, config):
         node_key = urgent_node_key(event, state)
         if card_metadata.get("last_urgent_node") != node_key:
             urgent_message(message_id, config)
@@ -1068,6 +1074,10 @@ def sweep_turn_events():
         if new_offset <= old_offset:
             atomic_json(state_path, state)
             continue
+        catching_up = (
+            len(records) > MAX_LIVE_SWEEP_RECORDS
+            or new_offset - old_offset > MAX_LIVE_SWEEP_BYTES
+        )
 
         changed = False
         event_kind = ""
@@ -1193,12 +1203,13 @@ def sweep_turn_events():
                     })
                     completion_kind = "completed"
                 changed = True
-                event_kind = ""
+                event_kind = completion_kind if catching_up else ""
                 event_marker = line_offset
-                completion_payload = {"turn-id": state.get("turn_id")}
-                if completion_kind != "completed":
-                    completion_payload["event-id"] = "progress-%s" % line_offset
-                enqueue(completion_kind, dict(state), completion_payload)
+                if not catching_up:
+                    completion_payload = {"turn-id": state.get("turn_id")}
+                    if completion_kind != "completed":
+                        completion_payload["event-id"] = "progress-%s" % line_offset
+                    enqueue(completion_kind, dict(state), completion_payload)
 
             if item_type == "event_msg" and payload_type == "turn_aborted":
                 aborted_turn_id = str(payload.get("turn_id") or "")
@@ -1226,9 +1237,10 @@ def sweep_turn_events():
                     ),
                 })
                 changed = True
-                event_kind = ""
+                event_kind = "stopped" if catching_up else ""
                 event_marker = line_offset
-                enqueue("stopped", dict(state), {"turn-id": aborted_turn_id})
+                if not catching_up:
+                    enqueue("stopped", dict(state), {"turn-id": aborted_turn_id})
 
         state["rollout_path"] = str(rollout_path)
         state["rollout_offset"] = new_offset
@@ -1246,18 +1258,10 @@ def sweep_turn_starts():
 
 
 def sweep_elapsed():
-    now = int(time.time())
-    for path in (STATE_HOME / "sessions").glob("*.json"):
-        state = read_json(path, {})
-        if (not state.get("managed") or not state.get("active")
-                or not (state.get("turn_active") or state.get("goal_running"))):
-            continue
-        if now - int(state.get("last_elapsed_enqueue_at", 0)) < 5:
-            continue
-        state["last_elapsed_enqueue_at"] = now
-        state["updated_at"] = now
-        atomic_json(path, state)
-        enqueue("progress", state, {"event-id": "elapsed-%s" % (now // 5)})
+    # Feishu surfaces every card PATCH as message activity. Timer-only refreshes
+    # therefore wake the card repeatedly on mobile. Elapsed time is recomputed
+    # whenever real progress or a lifecycle event updates the card.
+    return
 
 
 def sweep_stale_card_pins():

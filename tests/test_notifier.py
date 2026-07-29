@@ -676,13 +676,13 @@ class DeliveryTests(unittest.TestCase):
         self.assertIn("等待 Goal 自动续跑", saved["current_step"])
         self.assertEqual(enqueue.call_args.args[0], "progress")
 
-    def test_goal_turns_reuse_goal_card(self):
+    def test_goal_turns_reuse_goal_card_without_realerting(self):
         first = event("started")
         first["state"].update({
             "goal_id": "goal-1", "goal_status": "active", "goal_running": True,
             "turn_cards": {"goal:goal-1": {
                 "message_id": "om_goal", "pinned_at": 200,
-                "last_urgent_node": "goal:goal-1:started",
+                "last_urgent_node": "goal:goal-1:turn-old:stopped",
             }},
         })
         self.write_session(first)
@@ -706,6 +706,35 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(patch.call_args.args[0], "om_goal")
         pin.assert_not_called()
         urgent.assert_not_called()
+
+    def test_large_backlog_collapses_intermediate_lifecycle_events(self):
+        data = event("started")
+        rollout = self.state_home / "rollout-thread-1.jsonl"
+        records = [
+            {"type": "event_msg", "payload": {
+                "type": "turn_aborted", "turn_id": "turn-1",
+                "reason": "interrupted", "completed_at": 130,
+                "duration_ms": 30000,
+            }},
+            {"type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "turn-2", "started_at": 131,
+            }},
+        ] + [{"type": "noop", "payload": {}}] * (notifier.MAX_LIVE_SWEEP_RECORDS + 1)
+        rollout.write_text(
+            "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+        )
+        data["state"].update({
+            "managed": True, "rollout_path": str(rollout), "rollout_offset": 0,
+        })
+        self.write_session(data)
+
+        with mock.patch.object(notifier, "goal_record_for_rollout", return_value={}), \
+             mock.patch.object(notifier, "enqueue") as enqueue, \
+             mock.patch.object(notifier.time, "time", return_value=131):
+            notifier.sweep_turn_events()
+
+        self.assertEqual([call.args[0] for call in enqueue.call_args_list], ["started"])
+        self.assertEqual(enqueue.call_args.args[1]["turn_id"], "turn-2")
 
     def test_goal_continuation_updates_title_to_current_stage(self):
         data = event("completed")
@@ -872,18 +901,13 @@ class DeliveryTests(unittest.TestCase):
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.args[0], "progress")
 
-    def test_elapsed_refresh_is_throttled_to_five_seconds(self):
+    def test_elapsed_time_does_not_generate_timer_only_card_updates(self):
         data = event("started")
         data["state"].update({"managed": True, "last_elapsed_enqueue_at": 100})
         self.write_session(data)
-        with mock.patch.object(notifier.time, "time", return_value=104), \
-             mock.patch.object(notifier, "enqueue") as enqueue:
+        with mock.patch.object(notifier, "enqueue") as enqueue:
             notifier.sweep_elapsed()
             enqueue.assert_not_called()
-        with mock.patch.object(notifier.time, "time", return_value=105), \
-             mock.patch.object(notifier, "enqueue") as enqueue:
-            notifier.sweep_elapsed()
-            enqueue.assert_called_once()
 
     def test_stale_pin_sweep_keeps_only_current_active_card(self):
         data = event("started")

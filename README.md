@@ -91,9 +91,11 @@ blocked, or limited) alert the phone.
 
 For a continuing Goal, every automatic turn resets the displayed task goal and
 timer. The first public commentary becomes that turn's organized stage goal;
-later public commentary updates the current step. `Current stage elapsed` runs
-from `task_started` to that turn's completion and then remains frozen while the
-Goal waits for its next automatic turn.
+later public commentary updates the current step. `Current stage elapsed` is
+recomputed on meaningful progress updates, runs from `task_started` to that
+turn's completion, and then remains frozen while the Goal waits for its next
+automatic turn. The notifier deliberately avoids timer-only card PATCH calls
+because Feishu mobile surfaces every card edit as message activity.
 
 Disable individual urgent nodes in the private `config.env`:
 

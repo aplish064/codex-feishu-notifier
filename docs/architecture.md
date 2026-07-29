@@ -26,6 +26,9 @@ overwrite the card's current stage. Each `task_started` event resets the stage
 summary and timer, the first public commentary supplies the organized stage
 goal, and later public commentary supplies the current step. Stage completion
 freezes that turn's duration while the card waits for automatic continuation.
+Timer-only refreshes are not sent: Feishu clients surface each card PATCH as
+message activity, so elapsed time is refreshed only with real progress or a
+lifecycle transition.
 
 ## State
 
@@ -43,6 +46,8 @@ logs/worker.log  background worker errors
 Outbox filenames are deterministic hashes. Delivery is retried with capped
 exponential backoff. Lifecycle alert nodes are idempotent per turn/Goal and
 status so worker restarts do not intentionally duplicate urgent notifications.
+When a worker must catch up a large rollout backlog, intermediate lifecycle
+records are folded into one final-state delivery rather than replayed to Feishu.
 
 ## Goal support
 
