@@ -1293,20 +1293,8 @@ def synchronize_goal_state(state, record, now):
 
     if goal_status == "active":
         state["goal_running"] = True
-        if previous_status in {
-            "completed", "stopped", "paused", "blocked", "usage_limited",
-            "rate_limited", "budget_limited",
-        }:
-            for key in ("failure_kind", "failure_message", "failure_http_status",
-                        "failure_at", "failure_at_ms", "abort_reason"):
-                state.pop(key, None)
-            state.update({
-                "status": "running",
-                "current_step": "Goal 正在继续执行",
-                "final_duration_seconds": None,
-                "turn_duration_seconds": None,
-            })
-            event_kind = "started"
+        # The Goal row describes the overall lifecycle, not an individual
+        # stage. Only a real rollout task_started event may start a new card.
     elif goal_status == "complete":
         for key in ("failure_kind", "failure_message", "failure_http_status",
                     "failure_at", "failure_at_ms", "abort_reason"):

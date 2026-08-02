@@ -1198,6 +1198,19 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(notifier.synchronize_goal_state(state, record, 210), "")
         self.assertEqual(state["status"], "rate_limited")
 
+    def test_active_goal_row_does_not_synthesize_stage_start(self):
+        state = event("stopped")["state"]
+        state.update({"goal_id": "goal-1", "goal_status": "blocked",
+                      "goal_running": False, "turn_id": "old-turn"})
+        record = {"goal_thread_id": "thread-1", "goal_id": "goal-1",
+                  "goal_status": "active", "goal_token_budget": None,
+                  "goal_tokens_used": 20, "goal_time_used_seconds": 30,
+                  "goal_created_at_ms": 100000, "goal_updated_at_ms": 220000}
+        self.assertEqual(notifier.synchronize_goal_state(state, record, 220), "")
+        self.assertEqual(state["status"], "stopped")
+        self.assertEqual(state["turn_id"], "old-turn")
+        self.assertTrue(state["goal_running"])
+
     def test_inactive_card_cleanup_recalls_all_terminal_kinds(self):
         data = event("completed")
         data["state"]["turn_cards"] = {
