@@ -275,9 +275,9 @@ class DeliveryTests(unittest.TestCase):
         data = event("completed", status="running")
         data["state"].update({
             "goal_id": "goal-1", "goal_status": "active", "goal_running": True,
-            "turn_cards": {"goal:goal-1": {
+            "turn_cards": {"turn-1": {
                 "message_id": "om_goal", "pinned_at": 200,
-                "last_urgent_node": "goal:goal-1:started",
+                "last_urgent_node": "turn-1:started",
             }},
         })
         self.write_session(data)
@@ -290,6 +290,26 @@ class DeliveryTests(unittest.TestCase):
         patch.assert_called_once()
         pin.assert_not_called()
         urgent.assert_not_called()
+
+    def test_current_legacy_goal_card_is_adopted_without_duplicate(self):
+        data = event("progress", status="running")
+        data["state"].update({"goal_id": "goal-1", "goal_status": "active",
+                              "goal_running": True, "active_card_key": "goal:goal-1",
+                              "turn_cards": {"goal:goal-1": {
+                                  "message_id": "om_goal", "pinned_at": 200}}})
+        self.write_session(data)
+        with mock.patch.object(notifier, "send_new_card") as send, \
+             mock.patch.object(notifier, "patch_card") as patch, \
+             mock.patch.object(notifier, "delete_message") as recall, \
+             mock.patch.object(notifier, "urgent_message"):
+            notifier.deliver_event(data, {})
+
+        send.assert_not_called()
+        patch.assert_called_once()
+        recall.assert_not_called()
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertNotIn("goal:goal-1", saved["turn_cards"])
+        self.assertEqual(saved["turn_cards"]["turn-1"]["message_id"], "om_goal")
 
     def test_urgent_can_be_disabled_per_node(self):
         for kind in ("started", "completed", "stopped"):
@@ -372,6 +392,7 @@ class DeliveryTests(unittest.TestCase):
 
         with mock.patch.object(notifier, "send_new_card", return_value="om_second") as send, \
              mock.patch.object(notifier, "pin_message"), \
+             mock.patch.object(notifier, "delete_message") as recall, \
              mock.patch.object(notifier, "urgent_message"), \
              mock.patch.object(notifier, "patch_card") as patch:
             notifier.deliver_event(second, {})
@@ -382,8 +403,9 @@ class DeliveryTests(unittest.TestCase):
             notifier.turn_card_idempotency_key("session-1", "turn-2"),
         )
         patch.assert_not_called()
+        recall.assert_called_once_with("om_first", {})
         saved = notifier.read_json(notifier.session_path("session-1"))
-        self.assertEqual(saved["turn_cards"]["turn-1"]["message_id"], "om_first")
+        self.assertIsNone(saved["turn_cards"]["turn-1"]["message_id"])
         self.assertEqual(saved["turn_cards"]["turn-2"]["message_id"], "om_second")
 
     def test_delayed_previous_turn_event_updates_previous_card(self):
@@ -661,7 +683,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(record["goal_status"], "active")
         self.assertNotIn("objective", record)
 
-    def test_active_goal_task_complete_stays_running(self):
+    def test_active_goal_task_complete_waits_for_next_stage(self):
         data = event("started")
         rollout = self.state_home / "rollout-thread-1.jsonl"
         rollout.write_text(json.dumps({
@@ -689,19 +711,20 @@ class DeliveryTests(unittest.TestCase):
             notifier.sweep_turn_events()
 
         saved = notifier.read_json(notifier.session_path("session-1"))
-        self.assertEqual(saved["status"], "running")
+        self.assertEqual(saved["status"], "waiting")
         self.assertFalse(saved["turn_active"])
         self.assertTrue(saved["goal_running"])
         self.assertIn("等待 Goal 自动续跑", saved["current_step"])
-        self.assertEqual(enqueue.call_args.args[0], "progress")
+        self.assertEqual(enqueue.call_args.args[0], "waiting")
 
-    def test_goal_turns_reuse_goal_card_without_realerting(self):
+    def test_goal_turns_create_new_card_recall_previous_without_realerting(self):
         first = event("started")
         first["state"].update({
             "goal_id": "goal-1", "goal_status": "active", "goal_running": True,
-            "turn_cards": {"goal:goal-1": {
+            "active_card_key": "turn-1",
+            "turn_cards": {"turn-1": {
                 "message_id": "om_goal", "pinned_at": 200,
-                "last_urgent_node": "goal:goal-1:turn-old:stopped",
+                "last_urgent_node": "turn-1:started",
             }},
         })
         self.write_session(first)
@@ -714,17 +737,58 @@ class DeliveryTests(unittest.TestCase):
         })
         notifier.atomic_json(notifier.session_path("session-1"), second["state"])
 
-        with mock.patch.object(notifier, "send_new_card") as send, \
+        with mock.patch.object(notifier, "send_new_card", return_value="om_stage_2") as send, \
              mock.patch.object(notifier, "patch_card") as patch, \
              mock.patch.object(notifier, "pin_message") as pin, \
+             mock.patch.object(notifier, "delete_message") as recall, \
              mock.patch.object(notifier, "urgent_message") as urgent:
             notifier.deliver_event(second, {})
 
-        send.assert_not_called()
-        patch.assert_called_once()
-        self.assertEqual(patch.call_args.args[0], "om_goal")
-        pin.assert_not_called()
+        send.assert_called_once()
+        patch.assert_not_called()
+        pin.assert_called_once_with("om_stage_2", {})
+        recall.assert_called_once_with("om_goal", {})
         urgent.assert_not_called()
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertIsNone(saved["turn_cards"]["turn-1"]["message_id"])
+        self.assertEqual(saved["turn_cards"]["turn-2"]["message_id"], "om_stage_2")
+
+    def test_expired_previous_card_is_marked_permanent_without_retry(self):
+        data = event("started")
+        data["state"].update({"turn_id": "turn-2", "last_started_turn_id": "turn-2",
+                              "active_card_key": "turn-1",
+                              "turn_cards": {"turn-1": {
+                                  "message_id": "om_expired", "pinned_at": None}}})
+        self.write_session(data)
+        error = RuntimeError('{"error":{"code":230009,"message":"Message has expired"}}')
+        with mock.patch.object(notifier, "send_new_card", return_value="om_stage_2"), \
+             mock.patch.object(notifier, "pin_message"), \
+             mock.patch.object(notifier, "patch_card"), \
+             mock.patch.object(notifier, "delete_message", side_effect=error) as recall, \
+             mock.patch.object(notifier, "urgent_message"):
+            notifier.deliver_event(data, {})
+            notifier.deliver_event(data, {})
+
+        recall.assert_called_once_with("om_expired", {})
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertEqual(saved["turn_cards"]["turn-1"]["recall_permanent_error"], "230009")
+
+    def test_later_goal_completion_creates_card_after_waiting_card_was_recalled(self):
+        data = event("completed")
+        data["state"].update({"goal_id": "goal-1", "goal_status": "complete",
+                              "goal_running": False, "turn_cards": {"turn-1": {
+                                  "message_id": None, "recalled_at": 8000,
+                                  "terminal_kind": "waiting"}}})
+        self.write_session(data)
+        with mock.patch.object(notifier, "send_new_card", return_value="om_goal_complete") as send, \
+             mock.patch.object(notifier, "urgent_message") as urgent:
+            notifier.deliver_event(data, {})
+
+        send.assert_called_once()
+        urgent.assert_called_once_with("om_goal_complete", {})
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertEqual(saved["turn_cards"]["turn-1:event-123"]["message_id"],
+                         "om_goal_complete")
 
     def test_large_backlog_collapses_intermediate_lifecycle_events(self):
         data = event("started")
@@ -928,7 +992,7 @@ class DeliveryTests(unittest.TestCase):
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.args[0], "completed")
 
-    def test_notify_hook_treats_active_goal_turn_completion_as_progress(self):
+    def test_notify_hook_marks_active_goal_stage_waiting(self):
         data = event("started")
         data["state"].update({
             "managed": True,
@@ -958,7 +1022,7 @@ class DeliveryTests(unittest.TestCase):
             notifier.hook_complete()
 
         saved = notifier.read_json(notifier.session_path("session-1"))
-        self.assertEqual(saved["status"], "running")
+        self.assertEqual(saved["status"], "waiting")
         self.assertFalse(saved["turn_active"])
         self.assertTrue(saved["goal_running"])
         self.assertEqual(saved["turn_duration_seconds"], 30)
@@ -966,7 +1030,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(saved.get("rollout_offset", 0), 0)
         self.assertIn("等待 Goal 自动续跑", saved["current_step"])
         enqueue.assert_called_once()
-        self.assertEqual(enqueue.call_args.args[0], "progress")
+        self.assertEqual(enqueue.call_args.args[0], "waiting")
 
     def test_notify_hook_ignores_active_goal_descendant_completion(self):
         data = event("started")
@@ -1134,7 +1198,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(notifier.synchronize_goal_state(state, record, 210), "")
         self.assertEqual(state["status"], "rate_limited")
 
-    def test_completed_card_cleanup_only_recalls_expired_success(self):
+    def test_inactive_card_cleanup_recalls_all_terminal_kinds(self):
         data = event("completed")
         data["state"]["turn_cards"] = {
             "turn-1": {"message_id": "om_completed", "pinned_at": None,
@@ -1143,16 +1207,17 @@ class DeliveryTests(unittest.TestCase):
                        "terminal_kind": "stopped", "terminal_at": 100},
         }
         self.write_session(data)
-        config = {"DELETE_COMPLETED_CARDS": "true",
-                  "DELETE_COMPLETED_CARDS_AFTER_HOURS": "24"}
+        config = {"RECALL_INACTIVE_CARDS": "true",
+                  "RECALL_AFTER_INACTIVE_SECONDS": "7200"}
         with mock.patch.object(notifier, "load_config", return_value=config), \
              mock.patch.object(notifier, "delete_message") as delete, \
-             mock.patch.object(notifier.time, "time", return_value=86500):
+             mock.patch.object(notifier.time, "time", return_value=7300):
             notifier.sweep_completed_card_cleanup(force=True)
-        delete.assert_called_once_with("om_completed", config)
+        self.assertEqual({call.args[0] for call in delete.call_args_list},
+                         {"om_completed", "om_stopped"})
         saved = notifier.read_json(notifier.session_path("session-1"))
         self.assertIsNone(saved["turn_cards"]["turn-1"]["message_id"])
-        self.assertEqual(saved["turn_cards"]["turn-2"]["message_id"], "om_stopped")
+        self.assertIsNone(saved["turn_cards"]["turn-2"]["message_id"])
 
     def test_rate_limit_probe_deduplicates_and_notifies_once(self):
         settings = {"provider": "test", "base_url": "https://example.invalid",

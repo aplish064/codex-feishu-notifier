@@ -88,9 +88,10 @@ rendered as rate-limited, while transport and other request errors are rendered
 as interrupted. A Goal database row older than the failure cannot overwrite the
 newer failure with a completed state.
 
-Completed cards can optionally be recalled after 24 hours. Cleanup is disabled
-by default because recall is irreversible; interrupted, blocked, pinned, and
-running cards are never removed by this cleanup.
+Each new turn or Goal stage recalls the previous card in that terminal. Any
+remaining non-running card is recalled after two hours of inactivity. Recall
+requires `im:message:recall`; expired messages are marked permanently and are
+not retried. Running and pinned cards are never removed by the inactivity sweep.
 
 HTTP 429 starts one persistent probe per provider, base URL, and model. The
 probe reloads the Codex API key at request time, never persists it, and sends a

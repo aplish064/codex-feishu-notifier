@@ -18,7 +18,7 @@ Codex 启动后，只有在用户真正发送任务时才创建卡片。任务�
 - Manual `turn_aborted`, lost process, clean completion, and Goal terminal states.
 - Per-turn or cumulative Goal Token usage in the card metrics.
 - Deduplicated five-minute recovery probes after HTTP 429 failures.
-- Optional recall of successfully completed cards after 24 hours.
+- Recall superseded cards immediately and inactive cards after two hours.
 - No webhook server and no public inbound endpoint.
 
 ## Requirements
@@ -82,14 +82,15 @@ CODEX_TASK_NAME="payment-api" bin/codex-feishu
 
 | Node | Card action | Pin | Phone urgent |
 |---|---|---:|---:|
-| User submits a task | Create/update running card | Add | Yes |
+| User submits a task | Create a new running card; recall the previous card | Add | Yes |
 | Progress | Patch the current card | Keep | No |
 | Completed | Patch to green | Remove | Yes |
 | Interrupted/lost | Patch to red | Remove | Yes |
-| Goal continues next turn | Reuse Goal card | Keep | No extra card |
+| Goal continues next stage | Create a new card; recall the previous stage | Add | No extra urgent |
 
-Completing an automatic turn inside an active Goal is progress, not a Goal
-completion. It patches the existing card without an urgent notification. Only
+Completing an automatic turn inside an active Goal moves that stage card to a
+non-running waiting state and unpins it. The next `task_started` event creates
+a new stage card and recalls the previous one without an urgent notification. Only
 the initial Goal start and terminal Goal states (complete, interrupted, paused,
 blocked, or limited) alert the phone.
 
@@ -126,17 +127,19 @@ PROBE_429_INTERVAL_SECONDS=300
 PROBE_429_MAX_HOURS=24
 ```
 
-Completed-card cleanup uses Feishu message recall and is therefore disabled by
-default. After granting `im:message:recall` and validating recall with a test
-message, enable it explicitly:
+Card cleanup uses irreversible Feishu message recall and requires
+`im:message:recall`. A new turn or Goal stage recalls the previous card
+immediately. Otherwise, any completed, interrupted, paused, blocked, or limited
+card is recalled after two hours of inactivity:
 
 ```bash
-DELETE_COMPLETED_CARDS=true
-DELETE_COMPLETED_CARDS_AFTER_HOURS=24
+RECALL_INACTIVE_CARDS=true
+RECALL_AFTER_INACTIVE_SECONDS=7200
+RECALL_MAX_MESSAGE_AGE_SECONDS=84600
 ```
 
-Only successful, unpinned cards are removed. Interrupted, blocked, rate-limited,
-and running cards are retained.
+Running cards are never recalled by the inactivity sweep. Error `230009` is
+recorded as permanent expiry and is not retried.
 
 ## How It Works
 

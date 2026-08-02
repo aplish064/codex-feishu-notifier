@@ -93,9 +93,10 @@ fi
   printf 'PROBE_429_MAX_HOURS=24\n'
   printf 'PROBE_429_TIMEOUT_SECONDS=20\n'
   printf "PROBE_429_USER_AGENT='codex_cli_rs/0.146.0'\n"
-  printf 'DELETE_COMPLETED_CARDS=false\n'
-  printf 'DELETE_COMPLETED_CARDS_AFTER_HOURS=24\n'
-  printf 'CARD_CLEANUP_SWEEP_SECONDS=900\n'
+  printf 'RECALL_INACTIVE_CARDS=true\n'
+  printf 'RECALL_AFTER_INACTIVE_SECONDS=7200\n'
+  printf 'RECALL_MAX_MESSAGE_AGE_SECONDS=84600\n'
+  printf 'CARD_CLEANUP_SWEEP_SECONDS=300\n'
 } >"${config_path}"
 chmod 600 "${config_path}"
 

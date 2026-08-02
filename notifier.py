@@ -38,7 +38,7 @@ GOALS_DB_PATH = Path(
 DEFAULT_LARK_CLI = SCRIPT_DIR / "bin" / "lark-cli"
 MAX_LIVE_SWEEP_RECORDS = 500
 MAX_LIVE_SWEEP_BYTES = 512 * 1024
-TERMINAL_CARD_KINDS = {"completed", "stopped", "closed", "paused", "blocked",
+TERMINAL_CARD_KINDS = {"completed", "stopped", "closed", "waiting", "paused", "blocked",
                        "usage_limited", "rate_limited", "budget_limited", "archived"}
 LAST_CARD_CLEANUP_SWEEP = 0
 
@@ -457,13 +457,13 @@ def hook_complete():
         turn_duration = max(0, int(payload.get("duration_ms", 0)) // 1000) \
             if payload.get("duration_ms") is not None else max(0, now - turn_started_at)
         common.update({
-            "status": "running",
+            "status": "waiting",
             "goal_running": True,
             "current_step": "本轮已完成，等待 Goal 自动续跑",
             "turn_duration_seconds": turn_duration,
             "final_duration_seconds": turn_duration,
         })
-        event_kind = "progress"
+        event_kind = "waiting"
     else:
         common.update({
             "status": "completed",
@@ -546,6 +546,7 @@ def render_card(event, monitor=True):
     styles = {
         "started": ("Codex 任务已启动", "运行中", "blue", "blue-50", "blue"),
         "completed": ("Codex 任务已完成", "已完成", "green", "green-50", "green"),
+        "waiting": ("Codex Goal 阶段已完成", "等待续跑", "grey", "grey-50", "neutral"),
         "stopped": ("Codex 任务意外中断", "需检查", "red", "red-50", "red"),
         "closed": ("Codex 终端已关闭", "已关闭", "grey", "grey-50", "neutral"),
         "paused": ("Codex Goal 已暂停", "已暂停", "orange", "orange-50", "orange"),
@@ -713,10 +714,24 @@ def turn_key_from_state(state, fallback=""):
 
 
 def card_key_from_state(state, fallback=""):
-    goal_id = state.get("goal_id")
-    if goal_id:
-        return "goal:%s" % goal_id
     return turn_key_from_state(state, fallback)
+
+
+def adopt_legacy_goal_card(identifier, latest, event_state, card_key):
+    goal_id = event_state.get("goal_id") or latest.get("goal_id")
+    legacy_key = "goal:%s" % goal_id if goal_id else ""
+    cards = latest.get("turn_cards", {})
+    if (not legacy_key or not card_key or not isinstance(cards, dict)
+            or card_key in cards or legacy_key not in cards):
+        return latest
+    cards = dict(cards)
+    cards[card_key] = cards.pop(legacy_key)
+    latest = dict(latest)
+    latest["turn_cards"] = cards
+    if latest.get("active_card_key") in {None, "", legacy_key}:
+        latest["active_card_key"] = card_key
+    atomic_json(session_path(identifier), latest)
+    return latest
 
 
 def turn_card_metadata(latest, event_state, card_key):
@@ -795,6 +810,60 @@ def delete_message(message_id, config):
     cli = config.get("LARK_CLI", str(DEFAULT_LARK_CLI))
     run_cli([cli, "im", "messages", "delete", "--message-id", message_id,
              "--as", "bot", "--yes"])
+
+
+def recall_error_code(exc):
+    match = re.search(r'\b(230009)\b', str(exc))
+    return match.group(1) if match else ""
+
+
+def recall_previous_card(identifier, current_key, config):
+    path = session_path(identifier)
+    latest = read_json(path, {})
+    cards = latest.get("turn_cards", {})
+    if not isinstance(cards, dict):
+        cards = {}
+    current = dict(cards.get(current_key, {}))
+    previous_key = current.get("previous_card_key") or latest.get("active_card_key")
+    if not previous_key:
+        candidates = [key for key, metadata in cards.items()
+                      if key != current_key and isinstance(metadata, dict)
+                      and metadata.get("message_id")]
+        previous_key = candidates[-1] if candidates else ""
+    if not previous_key or previous_key == current_key:
+        latest["active_card_key"] = current_key
+        atomic_json(path, latest)
+        return False
+    previous = dict(cards.get(previous_key, {}))
+    message_id = previous.get("message_id")
+    if not message_id or previous.get("recalled_at") or previous.get("recall_permanent_error"):
+        latest["active_card_key"] = current_key
+        atomic_json(path, latest)
+        return False
+    now = int(time.time())
+    try:
+        delete_message(message_id, config)
+        previous.update({"message_id": None, "recalled_message_id": message_id,
+                         "recalled_at": now, "recall_reason": "superseded"})
+        previous.pop("recall_error", None)
+    except Exception as exc:
+        code = recall_error_code(exc)
+        previous["recall_error"] = "230009: message expired" if code else concise_title(
+            " ".join(str(exc).split()), limit=180)
+        previous["recall_attempts"] = int(previous.get("recall_attempts", 0)) + 1
+        if code:
+            previous["recall_permanent_error"] = code
+            previous["recall_expired_at"] = now
+        else:
+            cards[previous_key] = previous
+            latest["turn_cards"] = cards
+            atomic_json(path, latest)
+            raise
+    cards[previous_key] = previous
+    latest["turn_cards"] = cards
+    latest["active_card_key"] = current_key
+    atomic_json(path, latest)
+    return True
 
 
 def codex_provider_settings():
@@ -998,6 +1067,7 @@ def deliver_event(event, config):
     latest = read_json(session_path(identifier), {})
     event_state = event["state"]
     card_key = card_key_from_state(event_state, event["id"])
+    latest = adopt_legacy_goal_card(identifier, latest, event_state, card_key)
     latest_is_same_card = card_key_from_state(latest) == card_key
     if (latest_is_same_card
             and int(latest.get("updated_at", 0)) >= int(event_state.get("updated_at", 0))):
@@ -1009,14 +1079,29 @@ def deliver_event(event, config):
     live_event["kind"] = card_kind_for_state(state, event["kind"])
 
     card_metadata = turn_card_metadata(latest, event_state, card_key)
-    if card_metadata.get("deleted_at"):
-        return
+    previous_card_key = card_metadata.get("previous_card_key") or latest.get("active_card_key")
+    if not previous_card_key:
+        cards = latest.get("turn_cards", {})
+        candidates = [key for key, metadata in cards.items()
+                      if key != card_key and isinstance(metadata, dict)
+                      and metadata.get("message_id")] if isinstance(cards, dict) else []
+        previous_card_key = candidates[-1] if candidates else ""
+    unavailable = (card_metadata.get("deleted_at") or card_metadata.get("recalled_at")
+                   or card_metadata.get("recall_permanent_error"))
+    if unavailable:
+        if (live_event["kind"] not in TERMINAL_CARD_KINDS
+                or card_metadata.get("terminal_kind") == live_event["kind"]):
+            return
+        # A later terminal transition still needs a visible notification even
+        # when its stage card was already recalled after the inactivity window.
+        card_key = "%s:%s" % (card_key, event["id"])
+        card_metadata = turn_card_metadata(latest, event_state, card_key)
+        previous_card_key = ""
     existing_cards = latest.get("turn_cards", {})
     if (card_metadata
             and (not isinstance(existing_cards, dict) or card_key not in existing_cards)):
         save_turn_card_metadata(identifier, card_key, **card_metadata)
     message_id = card_metadata.get("message_id")
-    card_existed = bool(message_id)
     if message_id:
         patch_card(message_id, render_card(live_event, monitor=True), config)
     else:
@@ -1026,7 +1111,13 @@ def deliver_event(event, config):
             config,
         )
         card_metadata["message_id"] = message_id
-        save_turn_card_metadata(identifier, card_key, message_id=message_id)
+        card_metadata["message_created_at"] = int(time.time())
+        card_metadata["previous_card_key"] = previous_card_key
+        save_turn_card_metadata(
+            identifier, card_key, message_id=message_id,
+            message_created_at=card_metadata["message_created_at"],
+            previous_card_key=previous_card_key,
+        )
 
     if live_event["kind"] == "started":
         if not card_metadata.get("pinned_at"):
@@ -1034,6 +1125,7 @@ def deliver_event(event, config):
             pinned_at = int(time.time())
             card_metadata["pinned_at"] = pinned_at
             save_turn_card_metadata(identifier, card_key, pinned_at=pinned_at, unpinned_at=None)
+        recall_previous_card(identifier, card_key, config)
     elif card_metadata.get("pinned_at"):
         unpin_message(message_id, config)
         unpinned_at = int(time.time())
@@ -1041,11 +1133,12 @@ def deliver_event(event, config):
         card_metadata["unpinned_at"] = unpinned_at
         save_turn_card_metadata(identifier, card_key, pinned_at=None, unpinned_at=unpinned_at)
 
-    if live_event["kind"] == "completed":
+    if live_event["kind"] in TERMINAL_CARD_KINDS:
         terminal_at = int(card_metadata.get("terminal_at") or event.get("created_at") or time.time())
-        card_metadata.update({"terminal_at": terminal_at, "terminal_kind": "completed"})
+        card_metadata.update({"terminal_at": terminal_at, "terminal_kind": live_event["kind"],
+                              "inactive_since": terminal_at})
         save_turn_card_metadata(identifier, card_key, terminal_at=terminal_at,
-                                terminal_kind="completed")
+                                terminal_kind=live_event["kind"], inactive_since=terminal_at)
     elif live_event["kind"] == "started" and card_metadata.get("terminal_at"):
         card_metadata.update({"terminal_at": None, "terminal_kind": None})
         save_turn_card_metadata(identifier, card_key, terminal_at=None, terminal_kind=None)
@@ -1053,7 +1146,7 @@ def deliver_event(event, config):
     # Use the original event kind: progress refreshes can render a running card,
     # but only real lifecycle nodes should alert the user's phone.
     automatic_goal_continuation = bool(
-        event.get("kind") == "started" and state.get("goal_id") and card_existed
+        event.get("kind") == "started" and state.get("goal_id") and previous_card_key
     )
     if not automatic_goal_continuation and should_urgent_event(event, state, config):
         node_key = urgent_node_key(event, state)
@@ -1172,17 +1265,6 @@ def clear_goal_record(state):
         state.pop(key, None)
 
 
-def migrate_current_card_to_goal(state, goal_id):
-    old_key = turn_key_from_state(state)
-    new_key = "goal:%s" % goal_id
-    cards = state.get("turn_cards", {})
-    if not old_key or not isinstance(cards, dict) or new_key in cards or old_key not in cards:
-        return
-    cards = dict(cards)
-    cards[new_key] = cards.pop(old_key)
-    state["turn_cards"] = cards
-
-
 def current_turn_elapsed_seconds(state, now):
     if state.get("turn_duration_seconds") is not None:
         return max(0, int(state["turn_duration_seconds"]))
@@ -1196,7 +1278,6 @@ def synchronize_goal_state(state, record, now):
     previous_status = state.get("status")
     goal_id = record["goal_id"]
     if previous_goal_id != goal_id:
-        migrate_current_card_to_goal(state, goal_id)
         state.pop("goal_task_title", None)
         if state.get("task_goal_source") == "assistant_commentary":
             state["goal_task_title"] = state.get("task_title")
@@ -1545,7 +1626,7 @@ def sweep_turn_events():
                         register_rate_limit_probe(state)
                 elif state.get("goal_id") and state.get("goal_status") == "active":
                     state.update({
-                        "status": "running",
+                        "status": "waiting",
                         "turn_active": False,
                         "goal_running": True,
                         "updated_at": now,
@@ -1557,7 +1638,7 @@ def sweep_turn_events():
                         "turn_duration_seconds": turn_duration,
                         "final_duration_seconds": turn_duration,
                     })
-                    completion_kind = "progress"
+                    completion_kind = "waiting"
                 else:
                     state.update({
                         "status": "completed",
@@ -1672,14 +1753,18 @@ def sweep_stale_card_pins():
 def sweep_completed_card_cleanup(force=False):
     global LAST_CARD_CLEANUP_SWEEP
     config = load_config()
-    if not is_true(config.get("DELETE_COMPLETED_CARDS"), False):
+    enabled = config.get("RECALL_INACTIVE_CARDS")
+    if enabled is None:
+        enabled = config.get("DELETE_COMPLETED_CARDS")
+    if not is_true(enabled, False):
         return
     now = int(time.time())
     sweep_interval = max(60, int(config.get("CARD_CLEANUP_SWEEP_SECONDS", "900")))
     if not force and now - LAST_CARD_CLEANUP_SWEEP < sweep_interval:
         return
     LAST_CARD_CLEANUP_SWEEP = now
-    retention = max(1, int(config.get("DELETE_COMPLETED_CARDS_AFTER_HOURS", "24"))) * 3600
+    retention = max(60, int(config.get("RECALL_AFTER_INACTIVE_SECONDS", "7200")))
+    max_age = max(60, int(config.get("RECALL_MAX_MESSAGE_AGE_SECONDS", "84600")))
     for path in (STATE_HOME / "sessions").glob("*.json"):
         state = read_json(path, {})
         cards = state.get("turn_cards", {})
@@ -1691,26 +1776,40 @@ def sweep_completed_card_cleanup(force=False):
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
             message_id = metadata.get("message_id")
             terminal_kind = metadata.get("terminal_kind")
-            if not terminal_kind and str(metadata.get("last_urgent_node", "")).endswith(":completed"):
-                terminal_kind = "completed"
-            terminal_at = metadata.get("terminal_at") or metadata.get("unpinned_at")
-            if (terminal_kind != "completed" or not message_id or metadata.get("pinned_at")
-                    or metadata.get("deleted_at") or not terminal_at
-                    or now - int(terminal_at) < retention
+            inactive_since = metadata.get("inactive_since") or metadata.get("terminal_at") \
+                or metadata.get("unpinned_at")
+            if (terminal_kind not in TERMINAL_CARD_KINDS or not message_id
+                    or metadata.get("pinned_at") or metadata.get("recalled_at")
+                    or metadata.get("recall_permanent_error") or not inactive_since
+                    or now - int(inactive_since) < retention
                     or int(metadata.get("next_delete_attempt", 0)) > now):
+                continue
+            created_at = int(metadata.get("message_created_at") or 0)
+            if created_at and now - created_at >= max_age:
+                metadata.update({"recall_permanent_error": "230009",
+                                 "recall_error": "230009: message is beyond the safe recall age",
+                                 "recall_expired_at": now})
+                cards[key] = metadata
+                changed = True
                 continue
             try:
                 delete_message(message_id, config)
-                metadata.update({"message_id": None, "deleted_message_id": message_id,
-                                 "deleted_at": now,
+                metadata.update({"message_id": None, "recalled_message_id": message_id,
+                                 "recalled_at": now,
                                  "delete_attempts": int(metadata.get("delete_attempts", 0)) + 1})
                 metadata.pop("next_delete_attempt", None)
                 metadata.pop("delete_error", None)
             except Exception as exc:
                 attempts = int(metadata.get("delete_attempts", 0)) + 1
+                code = recall_error_code(exc)
                 metadata.update({"delete_attempts": attempts,
                                  "next_delete_attempt": now + min(3600, 60 * (2 ** min(attempts, 5))),
-                                 "delete_error": concise_title(str(exc), limit=180)})
+                                 "delete_error": "230009: message expired" if code else concise_title(
+                                     " ".join(str(exc).split()), limit=180)})
+                if code:
+                    metadata["recall_permanent_error"] = code
+                    metadata["recall_expired_at"] = now
+                    metadata.pop("next_delete_attempt", None)
             cards[key] = metadata
             changed = True
         if changed:
