@@ -12,6 +12,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +38,9 @@ GOALS_DB_PATH = Path(
 DEFAULT_LARK_CLI = SCRIPT_DIR / "bin" / "lark-cli"
 MAX_LIVE_SWEEP_RECORDS = 500
 MAX_LIVE_SWEEP_BYTES = 512 * 1024
+TERMINAL_CARD_KINDS = {"completed", "stopped", "closed", "paused", "blocked",
+                       "usage_limited", "rate_limited", "budget_limited", "archived"}
+LAST_CARD_CLEANUP_SWEEP = 0
 
 
 def load_config():
@@ -57,8 +62,57 @@ def is_true(value, default=False):
 
 
 def ensure_dirs():
-    for name in ("sessions", "outbox", "sent", "logs"):
+    for name in ("sessions", "outbox", "sent", "logs", "probes"):
         (STATE_HOME / name).mkdir(parents=True, exist_ok=True)
+
+
+def nested_number(value, key):
+    if isinstance(value, dict):
+        candidate = value.get(key)
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            return int(candidate)
+        for child in value.values():
+            found = nested_number(child, key)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = nested_number(child, key)
+            if found is not None:
+                return found
+    return None
+
+
+def classify_completion(payload):
+    error = payload.get("error")
+    if not error:
+        return "", "", None
+    if isinstance(error, dict):
+        message = str(error.get("message") or "")
+    else:
+        message = str(error)
+    http_status = nested_number(error, "http_status_code")
+    if http_status is None:
+        match = re.search(r"(?:status(?: code)?[: ]+|http[/ ]?)(429)\b|\b(429)\b", message, re.I)
+        if match:
+            http_status = 429
+    lowered = message.lower()
+    if http_status == 429 or "too many requests" in lowered or "rate limit" in lowered:
+        return "rate_limited", concise_title(message, limit=180), 429
+    return "stopped", concise_title(message or "Codex 请求异常结束", limit=180), http_status
+
+
+def token_count_text(value):
+    if value is None:
+        return "--"
+    number = max(0, int(value))
+    if number >= 1_000_000_000:
+        return "%.1fB" % (number / 1_000_000_000.0)
+    if number >= 1_000_000:
+        return "%.1fM" % (number / 1_000_000.0)
+    if number >= 1_000:
+        return "%.1fK" % (number / 1_000.0)
+    return str(number)
 
 
 def atomic_json(path, data):
@@ -368,16 +422,38 @@ def hook_complete():
             apply_goal_record(state, goal_record)
 
     active_goal = bool(state.get("goal_id") and state.get("goal_status") == "active")
+    failure_kind, failure_message, failure_http_status = classify_completion(payload)
+    completed_at = int(payload.get("completed_at", now))
     common = {
         "active": True,
         "turn_active": False,
         "updated_at": now,
-        "last_completed_at": now,
+        "last_completed_at": completed_at,
         "turn_started_at": turn_started_at,
         "task_title": extract_task_title(payload, state),
         "result_summary": extract_result_summary(payload),
     }
-    if active_goal:
+    if failure_kind:
+        common.update({
+            "status": failure_kind,
+            "goal_running": False,
+            "completed_at": completed_at,
+            "failure_kind": failure_kind,
+            "failure_message": failure_message,
+            "failure_http_status": failure_http_status,
+            "failure_at": completed_at,
+            "failure_at_ms": completed_at * 1000,
+            "abort_reason": "HTTP 429" if failure_kind == "rate_limited" else "request_error",
+            "current_step": "API 用量受限，等待服务恢复" if failure_kind == "rate_limited"
+            else "任务因请求异常中断",
+            "result_summary": failure_message,
+            "final_duration_seconds": max(0, int(payload.get("duration_ms", 0)) // 1000)
+            if payload.get("duration_ms") is not None else max(0, now - turn_started_at),
+        })
+        event_kind = "stopped"
+        if failure_kind == "rate_limited":
+            register_rate_limit_probe(state)
+    elif active_goal:
         turn_duration = max(0, int(payload.get("duration_ms", 0)) // 1000) \
             if payload.get("duration_ms") is not None else max(0, now - turn_started_at)
         common.update({
@@ -392,7 +468,7 @@ def hook_complete():
         common.update({
             "status": "completed",
             "goal_running": False,
-            "completed_at": int(payload.get("completed_at", now)),
+            "completed_at": completed_at,
             "current_step": "任务已完成",
             "final_duration_seconds": max(0, int(payload.get("duration_ms", 0)) // 1000)
             if payload.get("duration_ms") is not None else max(0, now - turn_started_at),
@@ -457,10 +533,9 @@ def card_kind_for_state(state, fallback):
     status = state.get("status")
     if status in {"running", "started"}:
         return "started"
-    if status in {
-        "completed", "stopped", "closed", "paused", "blocked",
-        "usage_limited", "budget_limited", "archived",
-    }:
+    if status == "recovered":
+        return "recovered"
+    if status in TERMINAL_CARD_KINDS:
         return status
     return fallback
 
@@ -476,8 +551,10 @@ def render_card(event, monitor=True):
         "paused": ("Codex Goal 已暂停", "已暂停", "orange", "orange-50", "orange"),
         "blocked": ("Codex Goal 已阻塞", "需处理", "red", "red-50", "red"),
         "usage_limited": ("Codex Goal 用量受限", "需处理", "orange", "orange-50", "orange"),
+        "rate_limited": ("Codex API 用量受限", "等待恢复", "orange", "orange-50", "orange"),
         "budget_limited": ("Codex Goal 预算受限", "需处理", "orange", "orange-50", "orange"),
         "archived": ("Codex Goal 历史卡片", "已归档", "grey", "grey-50", "neutral"),
+        "recovered": ("Codex API 服务已恢复", "已恢复", "green", "green-50", "green"),
     }
     title, status_label, template, background, accent = styles.get(kind, styles["started"])
     started = int(state.get("turn_started_at", state.get("started_at", event["created_at"])))
@@ -493,18 +570,19 @@ def render_card(event, monitor=True):
     project = Path(state.get("cwd", "unknown")).name
     duration_label = "当前阶段耗时" if state.get("goal_id") else "本轮耗时"
     metric_values = [(status_label, "状态"), (elapsed, duration_label)]
-    if kind == "stopped":
-        if state.get("abort_reason"):
-            reason = "用户停止" if state["abort_reason"] == "interrupted" else state["abort_reason"]
-            metric_values.append((str(reason), "中断原因"))
-        elif state.get("signal"):
-            metric_values.append((str(state["signal"]), "中断信号"))
-        else:
-            metric_values.append((str(state.get("exit_code", "unknown")), "退出码"))
-    elif kind in {"paused", "blocked", "usage_limited", "budget_limited"}:
-        metric_values.append((status_label, "Goal 状态"))
+    if kind == "recovered":
+        metric_values.append(("正常", "API 状态"))
     else:
-        metric_values.append(("运行中" if state.get("active") else "已结束", "终端"))
+        token_value = state.get("goal_tokens_used") if state.get("goal_id") \
+            else state.get("turn_tokens_used")
+        token_label = "Goal 累计 Token" if state.get("goal_id") else "本轮 Token"
+        if state.get("goal_id") and state.get("goal_token_budget"):
+            token_text = "%s / %s" % (
+                token_count_text(token_value), token_count_text(state["goal_token_budget"])
+            )
+        else:
+            token_text = token_count_text(token_value)
+        metric_values.append((token_text, token_label))
 
     focus_elements = [
         {"tag": "markdown", "content": "**<font color='%s'>任务目标</font>**" % accent},
@@ -525,6 +603,12 @@ def render_card(event, monitor=True):
         focus_elements.extend([
             {"tag": "markdown", "content": "**完成结果**", "text_size": "notation"},
             {"tag": "markdown", "content": md_escape(state["result_summary"]), "text_size": "notation"},
+        ])
+    if state.get("failure_message") and kind in {"stopped", "rate_limited"}:
+        focus_elements.extend([
+            {"tag": "markdown", "content": "**中断原因**", "text_size": "notation"},
+            {"tag": "markdown", "content": md_escape(state["failure_message"]),
+             "text_size": "notation"},
         ])
 
     columns = []
@@ -707,6 +791,162 @@ def unpin_message(message_id, config):
              "--as", "bot", "--yes"])
 
 
+def delete_message(message_id, config):
+    cli = config.get("LARK_CLI", str(DEFAULT_LARK_CLI))
+    run_cli([cli, "im", "messages", "delete", "--message-id", message_id,
+             "--as", "bot", "--yes"])
+
+
+def codex_provider_settings():
+    codex_home = CODEX_HOME
+    config_path = Path(os.environ.get("CODEX_CONFIG_PATH", str(codex_home / "config.toml")))
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    provider_match = re.search(r'^model_provider\s*=\s*["\']([^"\']+)', text, re.M)
+    model_match = re.search(r'^model\s*=\s*["\']([^"\']+)', text, re.M)
+    if not provider_match or not model_match:
+        return {}
+    provider = provider_match.group(1)
+    section = re.search(
+        r'^\[model_providers\.%s\]\s*$([\s\S]*?)(?=^\[|\Z)' % re.escape(provider),
+        text, re.M,
+    )
+    if not section:
+        return {}
+    body = section.group(1)
+    base_match = re.search(r'^base_url\s*=\s*["\']([^"\']+)', body, re.M)
+    wire_match = re.search(r'^wire_api\s*=\s*["\']([^"\']+)', body, re.M)
+    if not base_match or (wire_match and wire_match.group(1) != "responses"):
+        return {}
+    return {"provider": provider, "model": model_match.group(1),
+            "base_url": base_match.group(1).rstrip("/"),
+            "auth_path": str(codex_home / "auth.json")}
+
+
+def provider_fingerprint(settings):
+    raw = "%s|%s|%s" % (settings.get("provider", ""), settings.get("base_url", ""),
+                         settings.get("model", ""))
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def register_rate_limit_probe(state):
+    config = load_config()
+    if not is_true(config.get("PROBE_429_ENABLED"), True):
+        return
+    settings = codex_provider_settings()
+    if not settings:
+        return
+    ensure_dirs()
+    now = int(time.time())
+    fingerprint = provider_fingerprint(settings)
+    path = STATE_HOME / "probes" / (fingerprint + ".json")
+    probe = read_json(path, {})
+    if probe.get("status") != "watching":
+        probe = {"id": "%s-%s" % (fingerprint, now), "fingerprint": fingerprint,
+                 "provider": settings["provider"], "base_url": settings["base_url"],
+                 "model": settings["model"], "status": "watching", "detected_at": now,
+                 "next_probe_at": now + max(60, int(config.get("PROBE_429_INTERVAL_SECONDS", "300"))),
+                 "attempts": 0, "affected_tasks": []}
+    affected = list(probe.get("affected_tasks", []))
+    reference = {"instance_id": state.get("instance_id", ""),
+                 "card_key": card_key_from_state(state)}
+    if reference not in affected:
+        affected.append(reference)
+    probe["affected_tasks"] = affected[-50:]
+    atomic_json(path, probe)
+
+
+def probe_api(settings, timeout_seconds):
+    try:
+        api_key = read_json(Path(settings["auth_path"]), {}).get("OPENAI_API_KEY")
+        if not api_key:
+            return False, "missing_api_key"
+        body = json.dumps({"model": settings["model"], "input": "Reply OK.",
+                           "max_output_tokens": 16}, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            settings["base_url"] + "/responses", data=body, method="POST",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json",
+                     "User-Agent": load_config().get(
+                         "PROBE_429_USER_AGENT", "codex_cli_rs/0.146.0")})
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            response.read(1024)
+            return 200 <= int(response.status) < 300, "http_%s" % response.status
+    except urllib.error.HTTPError as exc:
+        return False, "http_%s" % exc.code
+    except (urllib.error.URLError, OSError, ValueError):
+        return False, "network_error"
+
+
+def recovery_event(probe, now):
+    return {"id": "recovery-" + probe["id"], "kind": "recovered", "created_at": now,
+            "state": {"instance_id": "api-recovery-" + probe["fingerprint"],
+                      "status": "recovered", "active": False, "turn_active": False,
+                      "cwd": str(WORKSPACE), "label": probe.get("provider", "Codex API"),
+                      "tty": "后台探针", "started_at": int(probe.get("detected_at", now)),
+                      "turn_started_at": int(probe.get("detected_at", now)),
+                      "task_title": "%s · %s" % (probe.get("provider", "Codex API"),
+                                                    probe.get("model", "")),
+                      "current_step": "API 探测请求已成功，服务恢复可用",
+                      "final_duration_seconds": max(0, now - int(probe.get("detected_at", now)))}}
+
+
+def sweep_rate_limit_probes():
+    config = load_config()
+    if not is_true(config.get("PROBE_429_ENABLED"), True):
+        return
+    now = int(time.time())
+    interval = max(60, int(config.get("PROBE_429_INTERVAL_SECONDS", "300")))
+    max_age = max(1, int(config.get("PROBE_429_MAX_HOURS", "24"))) * 3600
+    timeout_seconds = max(3, int(config.get("PROBE_429_TIMEOUT_SECONDS", "20")))
+    settings = codex_provider_settings()
+    for path in (STATE_HOME / "probes").glob("*.json"):
+        probe = read_json(path, {})
+        if probe.get("status") == "notifying":
+            if int(probe.get("notification_next_attempt", 0)) > now:
+                continue
+        elif probe.get("status") != "watching" or int(probe.get("next_probe_at", 0)) > now:
+            continue
+        elif now - int(probe.get("detected_at", now)) >= max_age:
+            probe.update({"status": "expired", "expired_at": now})
+            atomic_json(path, probe)
+            continue
+        else:
+            if not settings or provider_fingerprint(settings) != probe.get("fingerprint"):
+                probe.update({"last_result": "provider_config_unavailable",
+                              "next_probe_at": now + interval})
+                atomic_json(path, probe)
+                continue
+            recovered, result = probe_api(settings, timeout_seconds)
+            probe.update({"attempts": int(probe.get("attempts", 0)) + 1,
+                          "last_probe_at": now, "last_result": result})
+            if not recovered:
+                probe["next_probe_at"] = now + interval
+                atomic_json(path, probe)
+                continue
+            probe.update({"status": "notifying", "recovered_at": now})
+            atomic_json(path, probe)
+        try:
+            if not probe.get("recovery_message_id"):
+                event = recovery_event(probe, int(probe.get("recovered_at", now)))
+                probe["recovery_message_id"] = send_new_card(
+                    render_card(event, monitor=False), event["id"], config)
+                atomic_json(path, probe)
+            if (is_true(config.get("URGENT_ON_RECOVERY"), True)
+                    and not probe.get("recovery_urgent_sent")):
+                urgent_message(probe["recovery_message_id"], config)
+                probe["recovery_urgent_sent"] = True
+            probe["status"] = "recovered"
+            probe.pop("notification_next_attempt", None)
+            probe.pop("notification_error", None)
+            atomic_json(path, probe)
+        except Exception as exc:
+            probe["notification_error"] = concise_title(str(exc), limit=180)
+            probe["notification_next_attempt"] = now + 300
+            atomic_json(path, probe)
+
+
 def should_urgent(kind, config):
     keys = {
         "started": "URGENT_ON_STARTED",
@@ -769,6 +1009,8 @@ def deliver_event(event, config):
     live_event["kind"] = card_kind_for_state(state, event["kind"])
 
     card_metadata = turn_card_metadata(latest, event_state, card_key)
+    if card_metadata.get("deleted_at"):
+        return
     existing_cards = latest.get("turn_cards", {})
     if (card_metadata
             and (not isinstance(existing_cards, dict) or card_key not in existing_cards)):
@@ -798,6 +1040,15 @@ def deliver_event(event, config):
         card_metadata["pinned_at"] = None
         card_metadata["unpinned_at"] = unpinned_at
         save_turn_card_metadata(identifier, card_key, pinned_at=None, unpinned_at=unpinned_at)
+
+    if live_event["kind"] == "completed":
+        terminal_at = int(card_metadata.get("terminal_at") or event.get("created_at") or time.time())
+        card_metadata.update({"terminal_at": terminal_at, "terminal_kind": "completed"})
+        save_turn_card_metadata(identifier, card_key, terminal_at=terminal_at,
+                                terminal_kind="completed")
+    elif live_event["kind"] == "started" and card_metadata.get("terminal_at"):
+        card_metadata.update({"terminal_at": None, "terminal_kind": None})
+        save_turn_card_metadata(identifier, card_key, terminal_at=None, terminal_kind=None)
 
     # Use the original event kind: progress refreshes can render a running card,
     # but only real lifecycle nodes should alert the user's phone.
@@ -952,12 +1203,22 @@ def synchronize_goal_state(state, record, now):
     apply_goal_record(state, record)
     goal_status = record["goal_status"]
     event_kind = ""
+    failure_at_ms = int(state.get("failure_at_ms") or 0)
+    record_updated_at_ms = int(record.get("goal_updated_at_ms") or 0)
+    failure_is_newer = bool(failure_at_ms and record_updated_at_ms <= failure_at_ms)
+    if failure_is_newer and goal_status in {"active", "complete"}:
+        state["goal_running"] = False
+        return ""
 
     if goal_status == "active":
         state["goal_running"] = True
         if previous_status in {
-            "completed", "stopped", "paused", "blocked", "usage_limited", "budget_limited",
+            "completed", "stopped", "paused", "blocked", "usage_limited",
+            "rate_limited", "budget_limited",
         }:
+            for key in ("failure_kind", "failure_message", "failure_http_status",
+                        "failure_at", "failure_at_ms", "abort_reason"):
+                state.pop(key, None)
             state.update({
                 "status": "running",
                 "current_step": "Goal 正在继续执行",
@@ -966,6 +1227,9 @@ def synchronize_goal_state(state, record, now):
             })
             event_kind = "started"
     elif goal_status == "complete":
+        for key in ("failure_kind", "failure_message", "failure_http_status",
+                    "failure_at", "failure_at_ms", "abort_reason"):
+            state.pop(key, None)
         state.update({
             "status": "completed",
             "turn_active": False,
@@ -1166,6 +1430,8 @@ def sweep_turn_events():
                 for key in (
                     "message_id", "pinned_at", "unpinned_at", "last_urgent_node",
                     "abort_reason", "aborted_at", "last_aborted_at", "signal", "exit_code",
+                    "failure_kind", "failure_message", "failure_http_status",
+                    "failure_at", "failure_at_ms",
                 ):
                     state.pop(key, None)
                 active_goal = bool(
@@ -1186,11 +1452,30 @@ def sweep_turn_events():
                     "result_summary": "",
                     "final_duration_seconds": None,
                     "turn_duration_seconds": None,
+                    "turn_token_baseline": state.get("session_total_tokens"),
+                    "turn_tokens_used": 0,
                     "goal_running": active_goal,
                 })
                 changed = True
                 event_kind = "started"
                 event_marker = line_offset
+                continue
+
+            if item_type == "event_msg" and payload_type == "token_count":
+                info = payload.get("info", {})
+                total_usage = info.get("total_token_usage", {}) if isinstance(info, dict) else {}
+                last_usage = info.get("last_token_usage", {}) if isinstance(info, dict) else {}
+                total_tokens = nested_number(total_usage, "total_tokens")
+                last_tokens = nested_number(last_usage, "total_tokens")
+                if total_tokens is not None:
+                    state["session_total_tokens"] = total_tokens
+                    if state.get("turn_active"):
+                        baseline = state.get("turn_token_baseline")
+                        if baseline is None:
+                            baseline = max(0, total_tokens - int(last_tokens or 0))
+                            state["turn_token_baseline"] = baseline
+                        state["turn_tokens_used"] = max(0, total_tokens - int(baseline))
+                    changed = True
                 continue
 
             if not state.get("turn_active"):
@@ -1237,13 +1522,34 @@ def sweep_turn_events():
                     if duration_ms is not None else max(
                         0, now - int(state.get("turn_started_at", now))
                     )
-                if state.get("goal_id") and state.get("goal_status") == "active":
+                failure_kind, failure_message, failure_http_status = classify_completion(payload)
+                completed_at = int(payload.get("completed_at", now))
+                if failure_kind:
+                    state.update({
+                        "status": failure_kind, "turn_active": False, "goal_running": False,
+                        "updated_at": now, "last_completed_at": completed_at,
+                        "completed_at": completed_at, "failure_kind": failure_kind,
+                        "failure_message": failure_message,
+                        "failure_http_status": failure_http_status,
+                        "failure_at": completed_at, "failure_at_ms": completed_at * 1000,
+                        "abort_reason": "HTTP 429" if failure_kind == "rate_limited"
+                        else "request_error",
+                        "current_step": "API 用量受限，等待服务恢复"
+                        if failure_kind == "rate_limited" else "任务因请求异常中断",
+                        "result_summary": failure_message,
+                        "turn_duration_seconds": turn_duration,
+                        "final_duration_seconds": turn_duration,
+                    })
+                    completion_kind = "stopped"
+                    if failure_kind == "rate_limited":
+                        register_rate_limit_probe(state)
+                elif state.get("goal_id") and state.get("goal_status") == "active":
                     state.update({
                         "status": "running",
                         "turn_active": False,
                         "goal_running": True,
                         "updated_at": now,
-                        "last_completed_at": int(payload.get("completed_at", now)),
+                        "last_completed_at": completed_at,
                         "current_step": "本轮已完成，等待 Goal 自动续跑",
                         "result_summary": concise_title(
                             payload.get("last_agent_message", ""), limit=110
@@ -1258,8 +1564,8 @@ def sweep_turn_events():
                         "turn_active": False,
                         "goal_running": False,
                         "updated_at": now,
-                        "last_completed_at": int(payload.get("completed_at", now)),
-                        "completed_at": int(payload.get("completed_at", now)),
+                        "last_completed_at": completed_at,
+                        "completed_at": completed_at,
                         "current_step": "任务已完成",
                         "result_summary": concise_title(
                             payload.get("last_agent_message", ""), limit=110
@@ -1363,6 +1669,55 @@ def sweep_stale_card_pins():
             atomic_json(path, state)
 
 
+def sweep_completed_card_cleanup(force=False):
+    global LAST_CARD_CLEANUP_SWEEP
+    config = load_config()
+    if not is_true(config.get("DELETE_COMPLETED_CARDS"), False):
+        return
+    now = int(time.time())
+    sweep_interval = max(60, int(config.get("CARD_CLEANUP_SWEEP_SECONDS", "900")))
+    if not force and now - LAST_CARD_CLEANUP_SWEEP < sweep_interval:
+        return
+    LAST_CARD_CLEANUP_SWEEP = now
+    retention = max(1, int(config.get("DELETE_COMPLETED_CARDS_AFTER_HOURS", "24"))) * 3600
+    for path in (STATE_HOME / "sessions").glob("*.json"):
+        state = read_json(path, {})
+        cards = state.get("turn_cards", {})
+        if not isinstance(cards, dict):
+            continue
+        changed = False
+        cards = dict(cards)
+        for key, raw_metadata in cards.items():
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            message_id = metadata.get("message_id")
+            terminal_kind = metadata.get("terminal_kind")
+            if not terminal_kind and str(metadata.get("last_urgent_node", "")).endswith(":completed"):
+                terminal_kind = "completed"
+            terminal_at = metadata.get("terminal_at") or metadata.get("unpinned_at")
+            if (terminal_kind != "completed" or not message_id or metadata.get("pinned_at")
+                    or metadata.get("deleted_at") or not terminal_at
+                    or now - int(terminal_at) < retention
+                    or int(metadata.get("next_delete_attempt", 0)) > now):
+                continue
+            try:
+                delete_message(message_id, config)
+                metadata.update({"message_id": None, "deleted_message_id": message_id,
+                                 "deleted_at": now,
+                                 "delete_attempts": int(metadata.get("delete_attempts", 0)) + 1})
+                metadata.pop("next_delete_attempt", None)
+                metadata.pop("delete_error", None)
+            except Exception as exc:
+                attempts = int(metadata.get("delete_attempts", 0)) + 1
+                metadata.update({"delete_attempts": attempts,
+                                 "next_delete_attempt": now + min(3600, 60 * (2 ** min(attempts, 5))),
+                                 "delete_error": concise_title(str(exc), limit=180)})
+            cards[key] = metadata
+            changed = True
+        if changed:
+            state["turn_cards"] = cards
+            atomic_json(path, state)
+
+
 def sweep_stale():
     now = int(time.time())
     for path in (STATE_HOME / "sessions").glob("*.json"):
@@ -1406,6 +1761,8 @@ def worker():
         sweep_elapsed()
         drain()
         sweep_stale_card_pins()
+        sweep_completed_card_cleanup()
+        sweep_rate_limit_probes()
         sweep_stale()
         if source_path.stat().st_mtime != source_mtime:
             os.execv(sys.executable, [sys.executable, str(source_path), "worker"])

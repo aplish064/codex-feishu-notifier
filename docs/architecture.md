@@ -47,6 +47,7 @@ lark-home/       official CLI credentials and tokens
 sessions/        current terminal and card metadata
 outbox/          retryable notification events
 sent/            delivered event markers
+probes/          deduplicated 429 recovery probe state (never API keys)
 logs/worker.log  background worker errors
 ```
 
@@ -77,4 +78,20 @@ Cards may contain:
 - result summary, elapsed time, terminal label, project and working directory.
 
 Cards do not contain hidden model reasoning, raw tool arguments, shell command
-contents, tokens, App Secrets, or raw prompts as task titles.
+contents, App Secrets, API keys, or raw prompts as task titles. Token totals are
+read from Codex's public `token_count` events or the Goal database.
+
+## Failure, retention, and recovery
+
+`task_complete` is successful only when its payload has no `error`. HTTP 429 is
+rendered as rate-limited, while transport and other request errors are rendered
+as interrupted. A Goal database row older than the failure cannot overwrite the
+newer failure with a completed state.
+
+Completed cards can optionally be recalled after 24 hours. Cleanup is disabled
+by default because recall is irreversible; interrupted, blocked, pinned, and
+running cards are never removed by this cleanup.
+
+HTTP 429 starts one persistent probe per provider, base URL, and model. The
+probe reloads the Codex API key at request time, never persists it, and sends a
+single urgent recovery card after a minimal Responses API request succeeds.

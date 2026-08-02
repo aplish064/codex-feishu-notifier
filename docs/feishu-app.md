@@ -22,6 +22,7 @@ Enable these bot scopes in **Permissions & Scopes**:
 | `im:message:send_as_bot` | Send and patch Card 2.0 messages |
 | `im:message.pins:write_only` | Pin running cards and unpin terminal cards |
 | `im:message.urgent` | Send in-app urgent notifications to phones |
+| `im:message:recall` | Recall completed cards when retention cleanup is enabled |
 
 Depending on tenant policy, the console may offer the broader `im:message`
 scope instead of one of the granular scopes. Prefer the granular scope when

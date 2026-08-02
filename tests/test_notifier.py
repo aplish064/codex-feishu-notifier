@@ -79,15 +79,16 @@ class CardTests(unittest.TestCase):
         )
         self.assertEqual(goal, "完善学校人员发现、多源履历采集和验收网页。")
 
-    def test_manual_abort_shows_user_stop_reason(self):
+    def test_manual_abort_uses_token_metric_instead_of_terminal_metric(self):
         data = event("stopped")
         data["state"]["abort_reason"] = "interrupted"
+        data["state"]["turn_tokens_used"] = 12500
         card = notifier.render_card(data)
         metrics = card["body"]["elements"][1]["columns"]
         values = [column["elements"][0]["content"] for column in metrics]
         labels = [column["elements"][1]["content"] for column in metrics]
-        self.assertIn("**用户停止**", values)
-        self.assertTrue(any("中断原因" in label for label in labels))
+        self.assertIn("**12.5K**", values)
+        self.assertTrue(any("本轮 Token" in label for label in labels))
 
     def test_goal_card_uses_current_stage_elapsed_time(self):
         data = event("started")
@@ -107,6 +108,24 @@ class CardTests(unittest.TestCase):
         self.assertIn("**30s**", values)
         self.assertTrue(any("当前阶段耗时" in label for label in labels))
         self.assertFalse(any("本轮耗时" in label for label in labels))
+
+    def test_goal_card_uses_cumulative_goal_tokens(self):
+        data = event("started")
+        data["state"].update({"goal_id": "goal-1", "goal_tokens_used": 37479604,
+                              "goal_token_budget": 50000000})
+        card = notifier.render_card(data)
+        metrics = card["body"]["elements"][1]["columns"]
+        values = [column["elements"][0]["content"] for column in metrics]
+        labels = [column["elements"][1]["content"] for column in metrics]
+        self.assertIn("**37.5M / 50.0M**", values)
+        self.assertTrue(any("Goal 累计 Token" in label for label in labels))
+
+    def test_completion_classifier_detects_nested_429(self):
+        payload = {"error": {"message": "last status: 429 Too Many Requests",
+                             "codex_error_info": {"http_status_code": 429}}}
+        kind, message, status = notifier.classify_completion(payload)
+        self.assertEqual((kind, status), ("rate_limited", 429))
+        self.assertIn("Too Many Requests", message)
 
 
 class DeliveryTests(unittest.TestCase):
@@ -1102,6 +1121,64 @@ class DeliveryTests(unittest.TestCase):
 
         self.assertEqual(rollout, second)
         self.assertEqual(thread_id, "thread-2")
+
+    def test_stale_goal_complete_cannot_override_newer_failure(self):
+        state = event("started")["state"]
+        state.update({"goal_id": "goal-1", "goal_status": "active",
+                      "status": "rate_limited", "failure_at_ms": 200000,
+                      "goal_running": False})
+        record = {"goal_thread_id": "thread-1", "goal_id": "goal-1",
+                  "goal_status": "complete", "goal_token_budget": None,
+                  "goal_tokens_used": 20, "goal_time_used_seconds": 30,
+                  "goal_created_at_ms": 100000, "goal_updated_at_ms": 150000}
+        self.assertEqual(notifier.synchronize_goal_state(state, record, 210), "")
+        self.assertEqual(state["status"], "rate_limited")
+
+    def test_completed_card_cleanup_only_recalls_expired_success(self):
+        data = event("completed")
+        data["state"]["turn_cards"] = {
+            "turn-1": {"message_id": "om_completed", "pinned_at": None,
+                       "terminal_kind": "completed", "terminal_at": 100},
+            "turn-2": {"message_id": "om_stopped", "pinned_at": None,
+                       "terminal_kind": "stopped", "terminal_at": 100},
+        }
+        self.write_session(data)
+        config = {"DELETE_COMPLETED_CARDS": "true",
+                  "DELETE_COMPLETED_CARDS_AFTER_HOURS": "24"}
+        with mock.patch.object(notifier, "load_config", return_value=config), \
+             mock.patch.object(notifier, "delete_message") as delete, \
+             mock.patch.object(notifier.time, "time", return_value=86500):
+            notifier.sweep_completed_card_cleanup(force=True)
+        delete.assert_called_once_with("om_completed", config)
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertIsNone(saved["turn_cards"]["turn-1"]["message_id"])
+        self.assertEqual(saved["turn_cards"]["turn-2"]["message_id"], "om_stopped")
+
+    def test_rate_limit_probe_deduplicates_and_notifies_once(self):
+        settings = {"provider": "test", "base_url": "https://example.invalid",
+                    "model": "model", "auth_path": str(self.state_home / "auth.json")}
+        state = event("stopped")["state"]
+        config = {"PROBE_429_ENABLED": "true", "URGENT_ON_RECOVERY": "true"}
+        with mock.patch.object(notifier, "load_config", return_value=config), \
+             mock.patch.object(notifier, "codex_provider_settings", return_value=settings), \
+             mock.patch.object(notifier.time, "time", return_value=100):
+            notifier.register_rate_limit_probe(state)
+            notifier.register_rate_limit_probe(state)
+        path = self.state_home / "probes" / (notifier.provider_fingerprint(settings) + ".json")
+        probe = notifier.read_json(path)
+        self.assertEqual(len(probe["affected_tasks"]), 1)
+        probe["next_probe_at"] = 100
+        notifier.atomic_json(path, probe)
+        with mock.patch.object(notifier, "load_config", return_value=config), \
+             mock.patch.object(notifier, "codex_provider_settings", return_value=settings), \
+             mock.patch.object(notifier, "probe_api", return_value=(True, "http_200")), \
+             mock.patch.object(notifier, "send_new_card", return_value="om_recovered") as send, \
+             mock.patch.object(notifier, "urgent_message") as urgent, \
+             mock.patch.object(notifier.time, "time", return_value=400):
+            notifier.sweep_rate_limit_probes()
+            notifier.sweep_rate_limit_probes()
+        send.assert_called_once()
+        urgent.assert_called_once_with("om_recovered", config)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@ Codex 启动后，只有在用户真正发送任务时才创建卡片。任务�
 - Organized stage goals from each turn's first public execution summary instead of raw prompts.
 - Live progress, sanitized tool activity, current-stage elapsed time, terminal, and workspace.
 - Manual `turn_aborted`, lost process, clean completion, and Goal terminal states.
+- Per-turn or cumulative Goal Token usage in the card metrics.
+- Deduplicated five-minute recovery probes after HTTP 429 failures.
+- Optional recall of successfully completed cards after 24 hours.
 - No webhook server and no public inbound endpoint.
 
 ## Requirements
@@ -110,7 +113,30 @@ Disable individual urgent nodes in the private `config.env`:
 URGENT_ON_STARTED=false
 URGENT_ON_COMPLETED=true
 URGENT_ON_STOPPED=true
+URGENT_ON_RECOVERY=true
 ```
+
+429 recovery probing is enabled by default and stops after 24 hours. It uses the
+same Responses API provider, model, and credentials as Codex, sends the smallest
+valid request every five minutes, and never stores the API key:
+
+```bash
+PROBE_429_ENABLED=true
+PROBE_429_INTERVAL_SECONDS=300
+PROBE_429_MAX_HOURS=24
+```
+
+Completed-card cleanup uses Feishu message recall and is therefore disabled by
+default. After granting `im:message:recall` and validating recall with a test
+message, enable it explicitly:
+
+```bash
+DELETE_COMPLETED_CARDS=true
+DELETE_COMPLETED_CARDS_AFTER_HOURS=24
+```
+
+Only successful, unpinned cards are removed. Interrupted, blocked, rate-limited,
+and running cards are retained.
 
 ## How It Works
 
