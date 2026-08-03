@@ -395,8 +395,10 @@ def hook_complete():
             "hostname": os.uname().nodename,
             "started_at": now,
         }
+    payload_turn_id = str(payload.get("turn-id") or payload.get("turn_id") or "")
+    same_turn = not payload_turn_id or payload_turn_id == str(state.get("turn_id") or "")
     turn_started_at = int(
-        state.get("turn_started_at")
+        (state.get("turn_started_at") if same_turn else None)
         or payload.get("started_at")
         or state.get("last_completed_at", state.get("started_at", now))
     )
@@ -415,7 +417,13 @@ def hook_complete():
     if thread_id and (not state.get("managed") or not state.get("thread_id")):
         state["thread_id"] = str(thread_id)
     if rollout_path:
-        if not state.get("managed") or not state.get("rollout_path"):
+        thread_changed = bool(thread_id and str(thread_id) != str(state.get("thread_id") or ""))
+        if thread_changed:
+            clear_goal_record(state)
+            state["thread_id"] = str(thread_id)
+            state["rollout_path"] = str(rollout_path)
+            state["rollout_offset"] = rollout_path.stat().st_size
+        elif not state.get("managed") or not state.get("rollout_path"):
             state["rollout_path"] = str(rollout_path)
         if not state.get("managed"):
             state["rollout_offset"] = rollout_path.stat().st_size
@@ -431,6 +439,8 @@ def hook_complete():
         "updated_at": now,
         "last_completed_at": completed_at,
         "turn_started_at": turn_started_at,
+        "turn_id": payload_turn_id or state.get("turn_id"),
+        "last_started_turn_id": payload_turn_id or state.get("last_started_turn_id"),
         "task_title": extract_task_title(payload, state),
         "result_summary": extract_result_summary(payload),
     }
@@ -1103,6 +1113,7 @@ def deliver_event(event, config):
             and (not isinstance(existing_cards, dict) or card_key not in existing_cards)):
         save_turn_card_metadata(identifier, card_key, **card_metadata)
     message_id = card_metadata.get("message_id")
+    card_created = False
     if message_id:
         patch_card(message_id, render_card(live_event, monitor=True), config)
     else:
@@ -1112,6 +1123,7 @@ def deliver_event(event, config):
             config,
         )
         card_metadata["message_id"] = message_id
+        card_created = True
         card_metadata["message_created_at"] = int(time.time())
         card_metadata["previous_card_key"] = previous_card_key
         save_turn_card_metadata(
@@ -1126,6 +1138,8 @@ def deliver_event(event, config):
             pinned_at = int(time.time())
             card_metadata["pinned_at"] = pinned_at
             save_turn_card_metadata(identifier, card_key, pinned_at=pinned_at, unpinned_at=None)
+        recall_previous_card(identifier, card_key, config)
+    elif card_created:
         recall_previous_card(identifier, card_key, config)
     elif card_metadata.get("pinned_at"):
         unpin_message(message_id, config)
@@ -1356,6 +1370,8 @@ def sweep_goal_statuses():
         state = read_json(path, {})
         if not state.get("managed") or not state.get("active"):
             continue
+        if refresh_rollout_binding(state):
+            atomic_json(path, state)
         rollout_path = Path(state.get("rollout_path", ""))
         if not rollout_path.is_file():
             continue
@@ -1410,6 +1426,30 @@ def thread_from_shell_snapshot(state):
     return ""
 
 
+def refresh_rollout_binding(state):
+    snapshot_thread = thread_from_shell_snapshot(state)
+    if not snapshot_thread or snapshot_thread == str(state.get("thread_id") or ""):
+        return False
+    candidate = find_rollout_path(snapshot_thread)
+    if not candidate:
+        return False
+    candidate_metadata = rollout_metadata(candidate)
+    if (not candidate_metadata or candidate_metadata.get("parent_thread_id")
+            or candidate_metadata.get("cwd") != state.get("cwd")):
+        return False
+    current = Path(state.get("rollout_path", ""))
+    current_metadata = rollout_metadata(current) if current.is_file() else {}
+    if (current_metadata and int(candidate_metadata.get("started_at") or 0)
+            <= int(current_metadata.get("started_at") or 0)):
+        return False
+    state.update({"thread_id": snapshot_thread, "rollout_path": str(candidate),
+                  "rollout_offset": 0, "thread_rebound_at": int(time.time())})
+    clear_goal_record(state)
+    for key in ("goal_rollout_path", "goal_rollout_offset", "goal_rollout_thread_id"):
+        state.pop(key, None)
+    return True
+
+
 def assign_rollout(state):
     thread_id = state.get("thread_id") or thread_from_shell_snapshot(state)
     if thread_id:
@@ -1459,6 +1499,7 @@ def sweep_turn_events():
             # each historical transition.
             state["turn_active"] = False
             state["rollout_offset"] = 0
+        refresh_rollout_binding(state)
         terminal_rollout = Path(state.get("rollout_path", ""))
         if not terminal_rollout.is_file():
             terminal_rollout, thread_id = assign_rollout(state)

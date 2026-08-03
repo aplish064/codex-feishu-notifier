@@ -434,6 +434,21 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(patch.call_args.args[0], "om_first")
         unpin.assert_not_called()
 
+    def test_caught_up_completion_creates_current_card_and_recalls_previous(self):
+        data = event("completed")
+        data["state"].update({"turn_id": "turn-2", "last_started_turn_id": "turn-2",
+                              "active_card_key": "turn-1", "turn_cards": {"turn-1": {
+                                  "message_id": "om_first", "pinned_at": None}}})
+        self.write_session(data)
+        with mock.patch.object(notifier, "send_new_card", return_value="om_second"), \
+             mock.patch.object(notifier, "delete_message") as recall, \
+             mock.patch.object(notifier, "urgent_message"):
+            notifier.deliver_event(data, {})
+        recall.assert_called_once_with("om_first", {})
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertEqual(saved["active_card_key"], "turn-2")
+        self.assertEqual(saved["turn_cards"]["turn-2"]["message_id"], "om_second")
+
     def test_running_legacy_card_is_persisted_into_turn_cards(self):
         data = event("progress", status="running")
         data["state"].update({"message_id": "om_legacy", "pinned_at": 200})
@@ -1032,6 +1047,30 @@ class DeliveryTests(unittest.TestCase):
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.args[0], "waiting")
 
+    def test_notify_hook_switches_to_new_turn_after_new_command(self):
+        data = event("completed")
+        data["state"].update({"managed": True, "thread_id": "thread-old",
+                              "rollout_path": "/old-rollout.jsonl"})
+        self.write_session(data)
+        rollout = self.state_home / "rollout-new.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        payload = {"cwd": data["state"]["cwd"], "thread-id": "thread-new",
+                   "turn-id": "turn-new", "started_at": 200, "completed_at": 230,
+                   "duration_ms": 30000, "last-assistant-message": "新任务完成"}
+        with mock.patch.object(notifier, "parse_hook_payload", return_value=payload), \
+             mock.patch.dict(os.environ, {"CODEX_TASK_INSTANCE_ID": "session-1"}), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=rollout), \
+             mock.patch.object(notifier, "goal_record_for_rollout", return_value={}), \
+             mock.patch.object(notifier, "enqueue") as enqueue, \
+             mock.patch.object(notifier.time, "time", return_value=230):
+            notifier.hook_complete()
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertEqual(saved["thread_id"], "thread-new")
+        self.assertEqual(saved["turn_id"], "turn-new")
+        self.assertEqual(saved["turn_started_at"], 200)
+        self.assertEqual(saved["rollout_path"], str(rollout))
+        self.assertEqual(enqueue.call_args.args[1]["turn_id"], "turn-new")
+
     def test_notify_hook_ignores_active_goal_descendant_completion(self):
         data = event("started")
         data["state"].update({
@@ -1125,6 +1164,55 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in enqueue.call_args_list], ["completed", "started"])
         self.assertEqual(enqueue.call_args_list[0].args[1]["turn_id"], "turn-1")
         self.assertEqual(enqueue.call_args_list[1].args[1]["turn_id"], "turn-2")
+
+    def test_new_command_rebinds_terminal_to_newer_root_rollout(self):
+        old = self.state_home / "rollout-old.jsonl"
+        new = self.state_home / "rollout-new.jsonl"
+        for path, thread_id, timestamp in (
+            (old, "thread-old", "1970-01-01T00:01:40Z"),
+            (new, "thread-new", "1970-01-01T00:03:20Z"),
+        ):
+            path.write_text(json.dumps({"type": "session_meta", "payload": {
+                "session_id": thread_id, "parent_thread_id": None,
+                "cwd": "/home/hkustgz/Us", "timestamp": timestamp}}) + "\n",
+                encoding="utf-8")
+        snapshots = self.state_home / "snapshots"
+        snapshots.mkdir()
+        (snapshots / "thread-new.200.sh").write_text(
+            'declare -x CODEX_TASK_INSTANCE_ID="session-1"\n', encoding="utf-8")
+        state = event("completed")["state"]
+        state.update({"thread_id": "thread-old", "rollout_path": str(old),
+                      "rollout_offset": 999, "cwd": "/home/hkustgz/Us",
+                      "goal_id": "goal-old", "goal_status": "complete"})
+        with mock.patch.object(notifier, "SHELL_SNAPSHOTS_HOME", snapshots), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=new), \
+             mock.patch.object(notifier.time, "time", return_value=210):
+            changed = notifier.refresh_rollout_binding(state)
+        self.assertTrue(changed)
+        self.assertEqual(state["thread_id"], "thread-new")
+        self.assertEqual(state["rollout_offset"], 0)
+        self.assertNotIn("goal_id", state)
+
+    def test_new_command_does_not_bind_subagent_rollout(self):
+        old = self.state_home / "rollout-old.jsonl"
+        child = self.state_home / "rollout-child.jsonl"
+        old.write_text(json.dumps({"type": "session_meta", "payload": {
+            "session_id": "thread-old", "cwd": "/home/hkustgz/Us",
+            "timestamp": "1970-01-01T00:01:40Z"}}) + "\n", encoding="utf-8")
+        child.write_text(json.dumps({"type": "session_meta", "payload": {
+            "session_id": "thread-child", "parent_thread_id": "thread-new",
+            "cwd": "/home/hkustgz/Us", "timestamp": "1970-01-01T00:03:20Z"}}) + "\n",
+            encoding="utf-8")
+        snapshots = self.state_home / "snapshots"
+        snapshots.mkdir()
+        (snapshots / "thread-child.200.sh").write_text(
+            'declare -x CODEX_TASK_INSTANCE_ID="session-1"\n', encoding="utf-8")
+        state = {"instance_id": "session-1", "thread_id": "thread-old",
+                 "rollout_path": str(old), "cwd": "/home/hkustgz/Us"}
+        with mock.patch.object(notifier, "SHELL_SNAPSHOTS_HOME", snapshots), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=child):
+            self.assertFalse(notifier.refresh_rollout_binding(state))
+        self.assertEqual(state["thread_id"], "thread-old")
 
     def test_rollout_assignment_does_not_reuse_active_terminal_claim(self):
         sessions_home = self.state_home / "rollouts"
