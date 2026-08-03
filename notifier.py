@@ -407,6 +407,15 @@ def hook_complete():
         or payload.get("session-id") or payload.get("session_id")
     )
     rollout_path = find_rollout_path(thread_id)
+    rollout_info = rollout_metadata(rollout_path) if rollout_path else None
+    if is_descendant_rollout_metadata(rollout_info):
+        return
+    thread_changed = bool(
+        state.get("managed") and state.get("thread_id") and thread_id
+        and str(thread_id) != str(state.get("thread_id"))
+    )
+    if thread_changed and not rollout_info:
+        return
     goal_record = goal_record_for_rollout(rollout_path) if rollout_path else {}
     goal_record, _ = relevant_goal_record(state, goal_record)
     if (state.get("managed") and goal_record
@@ -1216,12 +1225,24 @@ def rollout_metadata(path):
     if item.get("type") != "session_meta":
         return None
     payload = item.get("payload", {})
+    source = payload.get("source")
+    thread_source = payload.get("thread_source")
+    if not thread_source and isinstance(source, dict) and source.get("subagent"):
+        thread_source = "subagent"
     return {
         "thread_id": payload.get("session_id") or payload.get("id"),
         "parent_thread_id": payload.get("parent_thread_id"),
+        "thread_source": thread_source,
         "cwd": payload.get("cwd"),
         "started_at": timestamp_seconds(payload.get("timestamp") or item.get("timestamp")),
     }
+
+
+def is_descendant_rollout_metadata(metadata):
+    return bool(metadata and (
+        metadata.get("parent_thread_id")
+        or metadata.get("thread_source") == "subagent"
+    ))
 
 
 def goal_record_for_rollout(path):
@@ -1434,7 +1455,7 @@ def refresh_rollout_binding(state):
     if not candidate:
         return False
     candidate_metadata = rollout_metadata(candidate)
-    if (not candidate_metadata or candidate_metadata.get("parent_thread_id")
+    if (not candidate_metadata or is_descendant_rollout_metadata(candidate_metadata)
             or candidate_metadata.get("cwd") != state.get("cwd")):
         return False
     current = Path(state.get("rollout_path", ""))
@@ -1465,7 +1486,8 @@ def assign_rollout(state):
             if str(path.resolve()) in claimed:
                 continue
             metadata = rollout_metadata(path)
-            if not metadata or metadata.get("cwd") != state.get("cwd"):
+            if (not metadata or is_descendant_rollout_metadata(metadata)
+                    or metadata.get("cwd") != state.get("cwd")):
                 continue
             delta = int(metadata.get("started_at", 0)) - started_at
             if -120 <= delta <= 600:

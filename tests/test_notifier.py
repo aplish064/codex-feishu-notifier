@@ -1053,7 +1053,11 @@ class DeliveryTests(unittest.TestCase):
                               "rollout_path": "/old-rollout.jsonl"})
         self.write_session(data)
         rollout = self.state_home / "rollout-new.jsonl"
-        rollout.write_text("{}\n", encoding="utf-8")
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "session_id": "thread-new", "parent_thread_id": None,
+            "thread_source": "user", "cwd": data["state"]["cwd"],
+            "timestamp": "1970-01-01T00:03:20Z",
+        }}) + "\n", encoding="utf-8")
         payload = {"cwd": data["state"]["cwd"], "thread-id": "thread-new",
                    "turn-id": "turn-new", "started_at": 200, "completed_at": 230,
                    "duration_ms": 30000, "last-assistant-message": "新任务完成"}
@@ -1070,6 +1074,57 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(saved["turn_started_at"], 200)
         self.assertEqual(saved["rollout_path"], str(rollout))
         self.assertEqual(enqueue.call_args.args[1]["turn_id"], "turn-new")
+
+    def test_notify_hook_ignores_subagent_completion_for_running_parent(self):
+        data = event("started")
+        data["state"].update({
+            "managed": True, "thread_id": "thread-root", "turn_id": "turn-root",
+            "rollout_path": "/root-rollout.jsonl", "task_title": "父任务仍在运行",
+            "current_step": "等待子任务结果",
+        })
+        self.write_session(data)
+        before = notifier.read_json(notifier.session_path("session-1"))
+        child_rollout = self.state_home / "rollout-child.jsonl"
+        child_rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "session_id": "thread-child", "parent_thread_id": "thread-root",
+            "thread_source": "subagent", "cwd": data["state"]["cwd"],
+            "timestamp": "1970-01-01T00:02:10Z",
+        }}) + "\n", encoding="utf-8")
+        payload = {
+            "cwd": data["state"]["cwd"], "thread-id": "thread-child",
+            "turn-id": "turn-child", "completed_at": 130,
+            "duration_ms": 30000, "last-assistant-message": "子任务已完成",
+        }
+
+        with mock.patch.object(notifier, "parse_hook_payload", return_value=payload), \
+             mock.patch.dict(os.environ, {"CODEX_TASK_INSTANCE_ID": "session-1"}), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=child_rollout), \
+             mock.patch.object(notifier, "goal_record_for_rollout") as goal_record, \
+             mock.patch.object(notifier, "enqueue") as enqueue:
+            notifier.hook_complete()
+
+        self.assertEqual(notifier.read_json(notifier.session_path("session-1")), before)
+        goal_record.assert_not_called()
+        enqueue.assert_not_called()
+
+    def test_notify_hook_ignores_unverified_different_thread(self):
+        data = event("started")
+        data["state"].update({"managed": True, "thread_id": "thread-root"})
+        self.write_session(data)
+        before = notifier.read_json(notifier.session_path("session-1"))
+        payload = {
+            "cwd": data["state"]["cwd"], "thread-id": "thread-unknown",
+            "turn-id": "turn-unknown", "completed_at": 130,
+            "last-assistant-message": "未知线程完成",
+        }
+        with mock.patch.object(notifier, "parse_hook_payload", return_value=payload), \
+             mock.patch.dict(os.environ, {"CODEX_TASK_INSTANCE_ID": "session-1"}), \
+             mock.patch.object(notifier, "find_rollout_path", return_value=None), \
+             mock.patch.object(notifier, "enqueue") as enqueue:
+            notifier.hook_complete()
+
+        self.assertEqual(notifier.read_json(notifier.session_path("session-1")), before)
+        enqueue.assert_not_called()
 
     def test_notify_hook_ignores_active_goal_descendant_completion(self):
         data = event("started")
