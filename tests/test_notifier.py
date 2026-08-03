@@ -1211,6 +1211,29 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(state["turn_id"], "old-turn")
         self.assertTrue(state["goal_running"])
 
+    def test_completed_goal_older_than_current_turn_is_detached_and_refreshed(self):
+        data = event("completed")
+        rollout = self.state_home / "rollout-thread-1.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        data["state"].update({"managed": True, "active": True,
+                              "rollout_path": str(rollout), "turn_started_at": 200,
+                              "goal_id": "goal-1", "goal_status": "complete",
+                              "goal_running": False, "current_step": "Goal 已完成"})
+        self.write_session(data)
+        record = {"goal_thread_id": "thread-1", "goal_id": "goal-1",
+                  "goal_status": "complete", "goal_token_budget": None,
+                  "goal_tokens_used": 20, "goal_time_used_seconds": 30,
+                  "goal_created_at_ms": 100000, "goal_updated_at_ms": 150000}
+        with mock.patch.object(notifier, "goal_record_for_rollout", return_value=record), \
+             mock.patch.object(notifier, "enqueue") as enqueue:
+            notifier.sweep_goal_statuses()
+
+        saved = notifier.read_json(notifier.session_path("session-1"))
+        self.assertNotIn("goal_id", saved)
+        self.assertEqual(saved["current_step"], "任务已完成")
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.args[0], "progress")
+
     def test_inactive_card_cleanup_recalls_all_terminal_kinds(self):
         data = event("completed")
         data["state"]["turn_cards"] = {

@@ -406,6 +406,7 @@ def hook_complete():
     )
     rollout_path = find_rollout_path(thread_id)
     goal_record = goal_record_for_rollout(rollout_path) if rollout_path else {}
+    goal_record, _ = relevant_goal_record(state, goal_record)
     if (state.get("managed") and goal_record
             and goal_record.get("goal_status") == "active"
             and thread_id
@@ -1265,6 +1266,23 @@ def clear_goal_record(state):
         state.pop(key, None)
 
 
+def relevant_goal_record(state, record):
+    if not record:
+        return {}, False
+    turn_started_at = int(state.get("turn_started_at") or 0)
+    goal_updated_at_ms = int(record.get("goal_updated_at_ms") or 0)
+    stale_complete = (record.get("goal_status") == "complete" and turn_started_at
+                      and goal_updated_at_ms and turn_started_at * 1000 > goal_updated_at_ms)
+    if not stale_complete:
+        return record, False
+    detached = state.get("goal_id") == record.get("goal_id")
+    if detached:
+        clear_goal_record(state)
+        if state.get("status") == "completed" and state.get("current_step") == "Goal 已完成":
+            state["current_step"] = "任务已完成"
+    return {}, detached
+
+
 def current_turn_elapsed_seconds(state, now):
     if state.get("turn_duration_seconds") is not None:
         return max(0, int(state["turn_duration_seconds"]))
@@ -1341,10 +1359,18 @@ def sweep_goal_statuses():
         rollout_path = Path(state.get("rollout_path", ""))
         if not rollout_path.is_file():
             continue
-        record = goal_record_for_rollout(rollout_path)
-        if not record:
-            continue
         before = json.dumps(state, ensure_ascii=False, sort_keys=True)
+        record, detached = relevant_goal_record(
+            state, goal_record_for_rollout(rollout_path))
+        if not record:
+            if json.dumps(state, ensure_ascii=False, sort_keys=True) != before:
+                atomic_json(path, state)
+            if detached:
+                enqueue("progress", state, {
+                    "event-id": "goal-detached-%s" % state.get("turn_id", now),
+                    "turn-id": state.get("turn_id"),
+                })
+            continue
         event_kind = synchronize_goal_state(state, record, now)
         if json.dumps(state, ensure_ascii=False, sort_keys=True) != before:
             atomic_json(path, state)
@@ -1443,7 +1469,8 @@ def sweep_turn_events():
             state["rollout_offset"] = 0
         normalized_rollout_offset(state, terminal_rollout, "rollout_offset")
 
-        goal_record = goal_record_for_rollout(terminal_rollout)
+        goal_record, _ = relevant_goal_record(
+            state, goal_record_for_rollout(terminal_rollout))
         if goal_record:
             goal_event_kind = synchronize_goal_state(state, goal_record, now)
             if goal_event_kind:
